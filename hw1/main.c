@@ -2,7 +2,7 @@
 #include <fcntl.h>     // for open mode macros and locks
 #include <stdlib.h>    // required for exit
 #include <string.h>    // required for strlen, strcat
-#include <sys/stat.h>  // required for mkdir
+#include <sys/stat.h>  // required for mkdir and stat
 #include <sys/wait.h>  // required for wait
 #include <time.h>      // required for logging time
 #include <unistd.h>    // required for read, write, close, fork
@@ -43,6 +43,16 @@ void intToStr(int num, char* str) {
     }
 }
 
+// Helper to create stdout messages
+void createMessage(char* buffer, const char* prefix, const char* name,
+                   const char* suffix) {
+    buffer[0] = '\0';  // Initialize the buffer
+    strcat(buffer, prefix);
+    strcat(buffer, name);
+    strcat(buffer, suffix);
+}
+
+// Helper to create log messages
 void createLogMessage(char* buffer, const char* message) {
     time_t now = time(NULL);
     struct tm* t = localtime(&now);
@@ -81,17 +91,7 @@ void createLogMessage(char* buffer, const char* message) {
     strcat(buffer, "\n");
 }
 
-// Helper to log operations
-void writeLog(const char* message) {
-    int fd = open(LOG_FILE, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
-
-    char logStr[512] = {0};
-    createLogMessage(logStr, message);
-    write(fd, logStr, strlen(logStr));
-    close(fd);
-}
-
+// Helper to write messages to stdout
 void writeMsg(const char* message) {
     char str[512] = {0};
     strcat(str, message);
@@ -99,27 +99,38 @@ void writeMsg(const char* message) {
     write(STDOUT_FILENO, str, strlen(str));
 }
 
-// Custom function to create message
-void createMessage(char* buffer, const char* prefix, const char* name,
-                   const char* suffix) {
-    buffer[0] = '\0';  // Initialize the buffer
-    strcat(buffer, prefix);
-    strcat(buffer, name);
-    strcat(buffer, suffix);
+// Helper to log operations
+void writeLog(const char* message) {
+    int fd =
+        open(LOG_FILE, O_WRONLY | O_APPEND | O_CREAT, 0644);  // Open log file
+    if (fd < 0) return;
+
+    char logStr[512] = {0};  // Create log message with full of null terminators
+    createLogMessage(logStr, message);
+    write(fd, logStr, strlen(logStr));
+    close(fd);
 }
 
-// Create Directory
 void createDir(const char* arg) {
     char msg[256] = "";
-    if (mkdir(arg, 0755) == 0) {
+    struct stat path_stat;
+    stat(arg, &path_stat);
+
+    if (S_ISDIR(path_stat.st_mode)) {
+        createMessage(msg, "Error: Directory \"", arg, "\" already exists.");
+    } else if (S_ISREG(path_stat.st_mode)) {
+        createMessage(msg, "Error: A file with the name \"", arg, "\" already exists.");
+    } else if (access(arg, F_OK) == 0) {
+        createMessage(msg, "Error: Path \"", arg, "\" already exists.");
+    } else if (mkdir(arg, 0755) == 0) {
         createMessage(msg, "Directory \"", arg, "\" created successfully.");
     } else {
-        createMessage(msg, "Error: Directory \"", arg, "\" already exists.");
+        createMessage(msg, "Error: Failed to create directory \"", arg, "\".");
     }
+
     writeMsg(msg);
     writeLog(msg);
 }
-
 // Create File
 void createFile(const char* fileName) {
     char msg[256] = "";
@@ -139,7 +150,7 @@ void createFile(const char* fileName) {
         char timeStr[256] = "Created at: ";
         strcat(timeStr, ctime(&now));
 
-        write(fd, timeStr, strlen(timeStr));
+        write(fd, timeStr, strlen(timeStr));  // Write creation time to file
         close(fd);
 
         createMessage(msg, "File \"", fileName, "\" created successfully.");
@@ -163,21 +174,28 @@ void listDir(const char* folderName) {
             _exit(0);
         }
 
-        struct dirent* entry;
+        struct dirent* entry;  // Read directory entries
         char header[256] = "";
         createMessage(header, "Contents of \"", folderName, "\":\n");
         write(STDOUT_FILENO, header, strlen(header));
-        while ((entry = readdir(dir)) != NULL) {
+        while ((entry = readdir(dir)) !=
+               NULL) {  // Print all entries except . and ..
             if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
                 write(STDOUT_FILENO, entry->d_name, strlen(entry->d_name));
                 write(STDOUT_FILENO, "\n", 1);
             }
         }
         closedir(dir);
-        _exit(0);
+        _exit(0);  // Exit child process
     } else {
-        wait(NULL);
+        wait(NULL);  // Wait for child process to finish
     }
+}
+
+const char* getFileExtension(const char* filename) {
+    const char* dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return "";
+    return dot;
 }
 
 // List Files by Extension
@@ -196,7 +214,8 @@ void listFilesByExtension(const char* folderName, const char* extension) {
         int found = 0;
         struct dirent* entry;
         while ((entry = readdir(dir)) != NULL) {
-            if (strstr(entry->d_name, extension)) {
+            const char* fileExt = getFileExtension(entry->d_name);
+            if (strcmp(fileExt, extension) == 0) {
                 write(STDOUT_FILENO, entry->d_name, strlen(entry->d_name));
                 write(STDOUT_FILENO, "\n", 1);
                 found = 1;
@@ -247,10 +266,23 @@ void readFile(const char* fileName) {
 void appendToFile(const char* fileName, const char* content) {
     int fd = open(fileName, O_WRONLY | O_APPEND);
     char msg[256] = "";
+    if (access(fileName, F_OK) != 0) {
+        createMessage(msg, "Error: File \"", fileName, "\" not found.");
+        writeLog(msg);
+        writeMsg(msg);
+        return;
+    } else if (access(fileName, W_OK) != 0) {
+        createMessage(msg, "Error: File \"", fileName,
+                      "\" is write-protected.");
+        writeLog(msg);
+        writeMsg(msg);
+        return;
+    }
     if (fd < 0) {
         createMessage(msg, "Error: Cannot open file \"", fileName,
                       "\" for appending.");
         writeLog(msg);
+        writeMsg(msg);
         return;
     }
 
@@ -333,7 +365,7 @@ void deleteDir(const char* folderName) {
         } else {
             char errMsg[256] = "";
             createMessage(errMsg, "Directory \"", folderName,
-                          "\" is not empty.\n");
+                          "\" is not empty.");
             writeMsg(errMsg);
             writeLog(errMsg);
         }
