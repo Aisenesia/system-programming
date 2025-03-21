@@ -1,16 +1,16 @@
-#include <dirent.h>  // required for opendir
-#include <fcntl.h>   // for open mode macros and locks
-// #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>    // strlen, sprintf
+#include <dirent.h>    // required for opendir
+#include <fcntl.h>     // for open mode macros and locks
+#include <stdlib.h>    // required for exit
+#include <string.h>    // required for strlen, strcat
 #include <sys/stat.h>  // required for mkdir
 #include <sys/wait.h>  // required for wait
 #include <time.h>      // required for logging time
-#include <unistd.h>
+#include <unistd.h>    // required for read, write, close, fork
 
 #define LOG_FILE "log.txt"
 
-// Custom function to convert integer to string
+// function to convert integer to string, required for logging time since stdio
+// is not allowed
 void intToStr(int num, char* str) {
     int i = 0;
     int isNegative = 0;
@@ -43,49 +43,42 @@ void intToStr(int num, char* str) {
     }
 }
 
-// Custom function to concatenate strings
-void strConcat(char* dest, const char* src) {
-    while (*dest) dest++;
-    while (*src) *dest++ = *src++;
-    *dest = '\0';
-}
-
 void createLogMessage(char* buffer, const char* message) {
     time_t now = time(NULL);
     struct tm* t = localtime(&now);
     char timeStr[20];
 
     intToStr(t->tm_year + 1900, timeStr);
-    strConcat(buffer, "[");
-    strConcat(buffer, timeStr);
-    strConcat(buffer, "-");
+    strcat(buffer, "[");
+    strcat(buffer, timeStr);
+    strcat(buffer, "-");
 
-    if (t->tm_mon + 1 < 10) strConcat(buffer, "0");
+    if (t->tm_mon + 1 < 10) strcat(buffer, "0");
     intToStr(t->tm_mon + 1, timeStr);
-    strConcat(buffer, timeStr);
-    strConcat(buffer, "-");
+    strcat(buffer, timeStr);
+    strcat(buffer, "-");
 
-    if (t->tm_mday < 10) strConcat(buffer, "0");
+    if (t->tm_mday < 10) strcat(buffer, "0");
     intToStr(t->tm_mday, timeStr);
-    strConcat(buffer, timeStr);
-    strConcat(buffer, " ");
+    strcat(buffer, timeStr);
+    strcat(buffer, " ");
 
-    if (t->tm_hour < 10) strConcat(buffer, "0");
+    if (t->tm_hour < 10) strcat(buffer, "0");
     intToStr(t->tm_hour, timeStr);
-    strConcat(buffer, timeStr);
-    strConcat(buffer, ":");
+    strcat(buffer, timeStr);
+    strcat(buffer, ":");
 
-    if (t->tm_min < 10) strConcat(buffer, "0");
+    if (t->tm_min < 10) strcat(buffer, "0");
     intToStr(t->tm_min, timeStr);
-    strConcat(buffer, timeStr);
-    strConcat(buffer, ":");
+    strcat(buffer, timeStr);
+    strcat(buffer, ":");
 
-    if (t->tm_sec < 10) strConcat(buffer, "0");
+    if (t->tm_sec < 10) strcat(buffer, "0");
     intToStr(t->tm_sec, timeStr);
-    strConcat(buffer, timeStr);
-    strConcat(buffer, "] ");
-    strConcat(buffer, message);
-    strConcat(buffer, "\n");
+    strcat(buffer, timeStr);
+    strcat(buffer, "] ");
+    strcat(buffer, message);
+    strcat(buffer, "\n");
 }
 
 // Helper to log operations
@@ -101,8 +94,8 @@ void writeLog(const char* message) {
 
 void writeMsg(const char* message) {
     char str[512] = {0};
-    strConcat(str, message);
-    strConcat(str, "\n");
+    strcat(str, message);
+    strcat(str, "\n");
     write(STDOUT_FILENO, str, strlen(str));
 }
 
@@ -110,17 +103,15 @@ void writeMsg(const char* message) {
 void createMessage(char* buffer, const char* prefix, const char* name,
                    const char* suffix) {
     buffer[0] = '\0';  // Initialize the buffer
-    strConcat(buffer, prefix);
-    strConcat(buffer, name);
-    strConcat(buffer, suffix);
+    strcat(buffer, prefix);
+    strcat(buffer, name);
+    strcat(buffer, suffix);
 }
 
 // Create Directory
 void createDir(const char* arg) {
-    // mkdir
     char msg[256] = "";
-    if (mkdir(arg, 0755) == 0) {  // 0755 is the permission, execution is
-                                  // required to list the directory
+    if (mkdir(arg, 0755) == 0) {
         createMessage(msg, "Directory \"", arg, "\" created successfully.");
     } else {
         createMessage(msg, "Error: Directory \"", arg, "\" already exists.");
@@ -133,14 +124,10 @@ void createDir(const char* arg) {
 void createFile(const char* fileName) {
     char msg[256] = "";
 
-    // check if file already exists
     if (access(fileName, F_OK) == 0) {
         createMessage(msg, "Error: File \"", fileName, "\" already exists.");
-
     } else {
-        // use file descriptors to create file
-        int fd = open(fileName, O_WRONLY | O_CREAT,
-                      0644);  // 0644 is the permission rw-r--r--
+        int fd = open(fileName, O_WRONLY | O_CREAT, 0644);
         if (fd < 0) {
             createMessage(msg, "Error creating file \"", fileName, "\".");
             writeMsg(msg);
@@ -150,25 +137,23 @@ void createFile(const char* fileName) {
 
         time_t now = time(NULL);
         char timeStr[256] = "Created at: ";
-        strConcat(timeStr, ctime(&now));  // create file content
+        strcat(timeStr, ctime(&now));
 
-        write(fd, timeStr, strlen(timeStr));  // write content to file
-        close(fd);                            // close file descriptor
+        write(fd, timeStr, strlen(timeStr));
+        close(fd);
 
         createMessage(msg, "File \"", fileName, "\" created successfully.");
     }
 
-    // log operation
     writeMsg(msg);
     writeLog(msg);
 }
 
 // List Directory
 void listDir(const char* folderName) {
-    pid_t pid = fork();  // fork the process
-    // if pid is 0, then it is the child process
+    pid_t pid = fork();
     if (pid == 0) {
-        DIR* dir = opendir(folderName);  // open directory
+        DIR* dir = opendir(folderName);
         if (!dir) {
             char errMsg[256] = "";
             createMessage(errMsg, "Error: Directory \"", folderName,
@@ -198,7 +183,7 @@ void listDir(const char* folderName) {
 // List Files by Extension
 void listFilesByExtension(const char* folderName, const char* extension) {
     pid_t pid = fork();
-    if (pid == 0) {  // Child
+    if (pid == 0) {
         DIR* dir = opendir(folderName);
         if (!dir) {
             char errMsg[256] = "";
@@ -221,8 +206,8 @@ void listFilesByExtension(const char* folderName, const char* extension) {
             char noFilesMsg[256] = "";
             createMessage(noFilesMsg, "No files with extension \"", extension,
                           "\" found in \"");
-            strConcat(noFilesMsg, folderName);
-            strConcat(noFilesMsg, "\".\n");
+            strcat(noFilesMsg, folderName);
+            strcat(noFilesMsg, "\".\n");
             write(STDOUT_FILENO, noFilesMsg, strlen(noFilesMsg));
         }
         closedir(dir);
@@ -234,7 +219,6 @@ void listFilesByExtension(const char* folderName, const char* extension) {
 
 // Read File
 void readFile(const char* fileName) {
-    // use file descriptors to read file
     int fd = open(fileName, O_RDONLY);
     if (fd < 0) {
         char msg[256] = "";
@@ -253,15 +237,14 @@ void readFile(const char* fileName) {
         return;
     }
 
-    buffer[bytesRead] = '\0';                 // null terminate the buffer
-    write(STDOUT_FILENO, buffer, bytesRead);  // print file content
-    write(STDOUT_FILENO, "\n", 1);            // print newline
-    close(fd);                                // close file descriptor
+    buffer[bytesRead] = '\0';
+    write(STDOUT_FILENO, buffer, bytesRead);
+    write(STDOUT_FILENO, "\n", 1);
+    close(fd);
 }
 
 // Append to File with Lock
 void appendToFile(const char* fileName, const char* content) {
-    // use file descriptors to append to file
     int fd = open(fileName, O_WRONLY | O_APPEND);
     char msg[256] = "";
     if (fd < 0) {
@@ -271,7 +254,6 @@ void appendToFile(const char* fileName, const char* content) {
         return;
     }
 
-    // lock the file
     struct flock lock;
     memset(&lock, 0, sizeof(lock));
     lock.l_type = F_WRLCK;
@@ -279,38 +261,34 @@ void appendToFile(const char* fileName, const char* content) {
         createMessage(msg, "Error: Cannot lock file \"", fileName,
                       "\" for appending.");
         writeLog(msg);
-
         close(fd);
         return;
     }
 
-    // write content to file
     int len = write(fd, content, strlen(content));
     if (len < 0) {
         createMessage(msg, "Error: Write operation failed, unlocking file \"",
                       fileName, "\".");
         writeLog(msg);
-        return;
-        // unlock the file
         lock.l_type = F_UNLCK;
         fcntl(fd, F_SETLK, &lock);
         close(fd);
         return;
     }
 
-    // unlock the file
     lock.l_type = F_UNLCK;
     fcntl(fd, F_SETLK, &lock);
-    close(fd);  // close file descriptor
+    close(fd);
 
     createMessage(msg, "Content appended to file \"", fileName,
                   "\" successfully.");
     writeLog(msg);
 }
 
+// Delete File
 void deleteFile(const char* fileName) {
     pid_t pid = fork();
-    if (pid == 0) {  // Child process
+    if (pid == 0) {
         if (access(fileName, F_OK) != 0) {
             char msg[256] = "";
             createMessage(msg, "Error: File \"", fileName, "\" not found.");
@@ -344,7 +322,6 @@ void deleteFile(const char* fileName) {
 
 // Delete Directory
 void deleteDir(const char* folderName) {
-    // use fork and do rmdir in child process
     pid_t pid = fork();
     if (pid == 0) {
         if (rmdir(folderName) == 0) {
@@ -360,7 +337,7 @@ void deleteDir(const char* folderName) {
             writeMsg(errMsg);
             writeLog(errMsg);
         }
-        _exit(0);  // use _exit to terminate the child process
+        _exit(0);
     } else {
         wait(NULL);
     }
