@@ -124,7 +124,6 @@ int pathExists(const char* path) {
     return stat(path, &path_stat) == 0;
 }
 
-
 void createDir(const char* arg) {
     struct stat path_stat;
     stat(arg, &path_stat);
@@ -132,7 +131,8 @@ void createDir(const char* arg) {
     if (S_ISDIR(path_stat.st_mode)) {
         handleError("Error: Directory \"", arg, "\" already exists.");
     } else if (S_ISREG(path_stat.st_mode)) {
-        handleError("Error: A file with the name \"", arg, "\" already exists.");
+        handleError("Error: A file with the name \"", arg,
+                    "\" already exists.");
     } else if (pathExists(arg)) {
         handleError("Error: Path \"", arg, "\" already exists.");
     } else if (mkdir(arg, 0755) == 0) {
@@ -166,6 +166,22 @@ void createFile(const char* fileName) {
 }
 // List Directory
 void listDir(const char* folderName) {
+    struct stat path_stat;
+    if (stat(folderName, &path_stat) != 0) {
+        handleError("Error: Cannot access \"", folderName, "\".");
+        return;
+    }
+
+    if (S_ISREG(path_stat.st_mode)) {
+        handleError("Error: \"", folderName, "\" is a file.");
+        return;
+    }
+
+    if (!S_ISDIR(path_stat.st_mode)) {
+        handleError("Error: \"", folderName, "\" is not a directory.");
+        return;
+    }
+
     pid_t pid = fork();
     if (pid == 0) {
         DIR* dir = opendir(folderName);
@@ -195,18 +211,30 @@ void listDir(const char* folderName) {
         wait(NULL);  // Wait for child process to finish
     }
 }
-
 const char* getFileExtension(const char* filename) {
     const char* dot = strrchr(filename, '.');
     if (!dot || dot == filename) return "";
     return dot;
 }
 
-
-
-
 // List Files by Extension
 void listFilesByExtension(const char* folderName, const char* extension) {
+    struct stat path_stat;
+    if (stat(folderName, &path_stat) != 0) {
+        handleError("Error: Cannot access \"", folderName, "\".");
+        return;
+    }
+
+    if (S_ISREG(path_stat.st_mode)) {
+        handleError("Error: \"", folderName, "\" is a file.");
+        return;
+    }
+
+    if (!S_ISDIR(path_stat.st_mode)) {
+        handleError("Error: \"", folderName, "\" is not a directory.");
+        return;
+    }
+
     pid_t pid = fork();
     if (pid == 0) {
         DIR* dir = opendir(folderName);
@@ -214,7 +242,8 @@ void listFilesByExtension(const char* folderName, const char* extension) {
             char errMsg[256] = "";
             createMessage(errMsg, "Error: Directory \"", folderName,
                           "\" not found.");
-            write(STDOUT_FILENO, errMsg, strlen(errMsg));
+            writeMsg(errMsg);
+            writeLog(errMsg);
             _exit(0);
         }
 
@@ -233,8 +262,9 @@ void listFilesByExtension(const char* folderName, const char* extension) {
             createMessage(noFilesMsg, "No files with extension \"", extension,
                           "\" found in \"");
             strcat(noFilesMsg, folderName);
-            strcat(noFilesMsg, "\".\n");
-            write(STDOUT_FILENO, noFilesMsg, strlen(noFilesMsg));
+            strcat(noFilesMsg, "\".");
+            writeMsg(noFilesMsg);
+            writeLog(noFilesMsg);
         }
         closedir(dir);
         _exit(0);
@@ -242,7 +272,6 @@ void listFilesByExtension(const char* folderName, const char* extension) {
         wait(NULL);
     }
 }
-
 // Read File
 void readFile(const char* fileName) {
     int fd = open(fileName, O_RDONLY);
@@ -386,9 +415,11 @@ void deleteDir(const char* folderName) {
             if (!pathExists(folderName)) {
                 handleError("Error: Directory \"", folderName, "\" not found.");
             } else if (access(folderName, W_OK) != 0) {
-                handleError("Error: Permission denied to delete directory \"", folderName, "\".");
+                handleError("Error: Permission denied to delete directory \"",
+                            folderName, "\".");
             } else {
-                handleError("Error: Directory \"", folderName, "\" is not empty.");
+                handleError("Error: Directory \"", folderName,
+                            "\" is not empty.");
             }
         }
         _exit(0);
