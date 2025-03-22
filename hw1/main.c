@@ -124,6 +124,7 @@ int pathExists(const char* path) {
     return stat(path, &path_stat) == 0;
 }
 
+// Create Directory
 void createDir(const char* arg) {
     struct stat path_stat;
     stat(arg, &path_stat);
@@ -211,6 +212,8 @@ void listDir(const char* folderName) {
         wait(NULL);  // Wait for child process to finish
     }
 }
+
+// Get File Extension
 const char* getFileExtension(const char* filename) {
     const char* dot = strrchr(filename, '.');
     if (!dot || dot == filename) return "";
@@ -272,12 +275,39 @@ void listFilesByExtension(const char* folderName, const char* extension) {
         wait(NULL);
     }
 }
+
 // Read File
 void readFile(const char* fileName) {
+    struct stat path_stat;
+    if (stat(fileName, &path_stat) != 0) {
+        char msg[256] = "";
+        createMessage(msg, "Error: File \"", fileName, "\" not found.");
+        writeMsg(msg);
+        writeLog(msg);
+        return;
+    }
+
+    if (S_ISDIR(path_stat.st_mode)) {
+        char msg[256] = "";
+        createMessage(msg, "Error: \"", fileName, "\" is a directory.");
+        writeMsg(msg);
+        writeLog(msg);
+        return;
+    }
+
+    if (!S_ISREG(path_stat.st_mode)) {
+        char msg[256] = "";
+        createMessage(msg, "Error: \"", fileName, "\" is not a regular file.");
+        writeMsg(msg);
+        writeLog(msg);
+        return;
+    }
+
     int fd = open(fileName, O_RDONLY);
     if (fd < 0) {
         char msg[256] = "";
-        createMessage(msg, "Error reading file \"", fileName, "\".");
+        createMessage(msg, "Error: Cannot access \"", fileName, "\".");
+        writeMsg(msg);
         writeLog(msg);
         return;
     }
@@ -287,6 +317,7 @@ void readFile(const char* fileName) {
     if (bytesRead < 0) {
         char msg[256] = "";
         createMessage(msg, "Error reading file \"", fileName, "\".");
+        writeMsg(msg);
         writeLog(msg);
         close(fd);
         return;
@@ -339,6 +370,7 @@ void appendToFile(const char* fileName, const char* content) {
         createMessage(msg, "Error: Cannot lock file \"", fileName,
                       "\" for appending.");
         writeLog(msg);
+        writeMsg(msg);
         close(fd);
         return;
     }
@@ -348,6 +380,7 @@ void appendToFile(const char* fileName, const char* content) {
         createMessage(msg, "Error: Write operation failed, unlocking file \"",
                       fileName, "\".");
         writeLog(msg);
+        writeMsg(msg);
         lock.l_type = F_UNLCK;
         fcntl(fd, F_SETLK, &lock);
         close(fd);
@@ -447,7 +480,7 @@ void printUsage() {
         "deleteFile \"fileName\"                    - Delete a file\n"
         "deleteDir \"folderName\"                   - Delete an empty "
         "directory\n"
-        "showLogs                                  - Display operation logs\n";
+        "showLogs                                 - Display operation logs\n";
 
     write(STDOUT_FILENO, usage, strlen(usage));
 }
