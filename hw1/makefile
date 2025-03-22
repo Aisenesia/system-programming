@@ -1,15 +1,22 @@
-CC = gcc
-CFLAGS = -Wall -g
-TARGET = main
-SRC = main.c
+.PHONY: all clear compile run clean d
 
-all: $(TARGET)
+all: clear compile
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
+clear: 
+	@clear
+
+compile: fileManager
+
+fileManager: main.c
+	@gcc main.c -o fileManager
+
+d:
+	@clear
+	@gcc -g -o deb main.c
+	@gdb deb
+
+run: fileManager
+	@./fileManager 
 
 clean:
-	rm -f $(TARGET)
-
-run: $(TARGET)
-	./$(TARGET) $(ARGS)
+	@rm -f fileManager deb

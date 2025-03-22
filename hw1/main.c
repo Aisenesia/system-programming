@@ -1,6 +1,5 @@
 #include <dirent.h>    // required for opendir
 #include <fcntl.h>     // for open mode macros and locks
-#include <stdlib.h>    // required for exit
 #include <string.h>    // required for strlen, strcat
 #include <sys/stat.h>  // required for mkdir and stat
 #include <sys/wait.h>  // required for wait
@@ -111,55 +110,60 @@ void writeLog(const char* message) {
     close(fd);
 }
 
-void createDir(const char* arg) {
+// Helper to handle errors
+void handleError(const char* prefix, const char* name, const char* suffix) {
     char msg[256] = "";
+    createMessage(msg, prefix, name, suffix);
+    writeMsg(msg);
+    writeLog(msg);
+}
+
+// Helper to check if a path exists
+int pathExists(const char* path) {
+    struct stat path_stat;
+    return stat(path, &path_stat) == 0;
+}
+
+
+void createDir(const char* arg) {
     struct stat path_stat;
     stat(arg, &path_stat);
 
     if (S_ISDIR(path_stat.st_mode)) {
-        createMessage(msg, "Error: Directory \"", arg, "\" already exists.");
+        handleError("Error: Directory \"", arg, "\" already exists.");
     } else if (S_ISREG(path_stat.st_mode)) {
-        createMessage(msg, "Error: A file with the name \"", arg, "\" already exists.");
-    } else if (access(arg, F_OK) == 0) {
-        createMessage(msg, "Error: Path \"", arg, "\" already exists.");
+        handleError("Error: A file with the name \"", arg, "\" already exists.");
+    } else if (pathExists(arg)) {
+        handleError("Error: Path \"", arg, "\" already exists.");
     } else if (mkdir(arg, 0755) == 0) {
-        createMessage(msg, "Directory \"", arg, "\" created successfully.");
+        handleError("Directory \"", arg, "\" created successfully.");
     } else {
-        createMessage(msg, "Error: Failed to create directory \"", arg, "\".");
+        handleError("Error: Failed to create directory \"", arg, "\".");
     }
-
-    writeMsg(msg);
-    writeLog(msg);
 }
+
 // Create File
 void createFile(const char* fileName) {
-    char msg[256] = "";
-
-    if (access(fileName, F_OK) == 0) {
-        createMessage(msg, "Error: File \"", fileName, "\" already exists.");
-    } else {
-        int fd = open(fileName, O_WRONLY | O_CREAT, 0644);
-        if (fd < 0) {
-            createMessage(msg, "Error creating file \"", fileName, "\".");
-            writeMsg(msg);
-            writeLog(msg);
-            return;
-        }
-
-        time_t now = time(NULL);
-        char timeStr[256] = "Created at: ";
-        strcat(timeStr, ctime(&now));
-
-        write(fd, timeStr, strlen(timeStr));  // Write creation time to file
-        close(fd);
-
-        createMessage(msg, "File \"", fileName, "\" created successfully.");
+    if (pathExists(fileName)) {
+        handleError("Error: File \"", fileName, "\" already exists.");
+        return;
     }
 
-    writeMsg(msg);
-    writeLog(msg);
-}
+    int fd = open(fileName, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        handleError("Error creating file \"", fileName, "\".");
+        return;
+    }
 
+    time_t now = time(NULL);
+    char timeStr[256] = "Created at: ";
+    strcat(timeStr, ctime(&now));
+
+    write(fd, timeStr, strlen(timeStr));  // Write creation time to file
+    close(fd);
+
+    handleError("File \"", fileName, "\" created successfully.");
+}
 // List Directory
 void listDir(const char* folderName) {
     pid_t pid = fork();
@@ -197,6 +201,9 @@ const char* getFileExtension(const char* filename) {
     if (!dot || dot == filename) return "";
     return dot;
 }
+
+
+
 
 // List Files by Extension
 void listFilesByExtension(const char* folderName, const char* extension) {
@@ -264,8 +271,18 @@ void readFile(const char* fileName) {
 
 // Append to File with Lock
 void appendToFile(const char* fileName, const char* content) {
-    int fd = open(fileName, O_WRONLY | O_APPEND);
+    struct stat path_stat;
+    stat(fileName, &path_stat);
+
     char msg[256] = "";
+    if (S_ISDIR(path_stat.st_mode)) {
+        createMessage(msg, "Error: \"", fileName, "\" is a directory.");
+        writeLog(msg);
+        writeMsg(msg);
+        return;
+    }
+
+    int fd = open(fileName, O_WRONLY | O_APPEND);
     if (access(fileName, F_OK) != 0) {
         createMessage(msg, "Error: File \"", fileName, "\" not found.");
         writeLog(msg);
@@ -314,6 +331,7 @@ void appendToFile(const char* fileName, const char* content) {
 
     createMessage(msg, "Content appended to file \"", fileName,
                   "\" successfully.");
+    writeMsg(msg);
     writeLog(msg);
 }
 
@@ -321,60 +339,63 @@ void appendToFile(const char* fileName, const char* content) {
 void deleteFile(const char* fileName) {
     pid_t pid = fork();
     if (pid == 0) {
-        if (access(fileName, F_OK) != 0) {
-            char msg[256] = "";
-            createMessage(msg, "Error: File \"", fileName, "\" not found.");
-            writeMsg(msg);
-            writeLog(msg);
+        struct stat path_stat;
+        stat(fileName, &path_stat);
+
+        if (S_ISDIR(path_stat.st_mode)) {
+            handleError("Error: \"", fileName, "\" is a directory.");
+            _exit(0);
+        }
+
+        if (!pathExists(fileName)) {
+            handleError("Error: File \"", fileName, "\" not found.");
             _exit(0);
         } else if (access(fileName, W_OK) != 0) {
-            char msg[256] = "";
-            createMessage(msg, "Error: File \"", fileName,
-                          "\" is write-protected.");
-            writeMsg(msg);
-            writeLog(msg);
+            handleError("Error: File \"", fileName, "\" is write-protected.");
             _exit(0);
         }
 
         if (unlink(fileName) == 0) {
-            char msg[256] = "";
-            createMessage(msg, "File \"", fileName, "\" deleted successfully.");
-            writeMsg(msg);
-            writeLog(msg);
+            handleError("File \"", fileName, "\" deleted successfully.");
         } else {
-            char msg[256] = "Error: File deletion failed.";
-            writeMsg(msg);
-            writeLog(msg);
+            handleError("Error: File deletion failed.", "", "");
         }
         _exit(0);
     } else {
         wait(NULL);
     }
 }
-
 // Delete Directory
 void deleteDir(const char* folderName) {
     pid_t pid = fork();
     if (pid == 0) {
+        struct stat path_stat;
+        if (stat(folderName, &path_stat) != 0) {
+            handleError("Error: Cannot access \"", folderName, "\".");
+            _exit(0);
+        }
+
+        if (!S_ISDIR(path_stat.st_mode)) {
+            handleError("Error: \"", folderName, "\" is not a directory.");
+            _exit(0);
+        }
+
         if (rmdir(folderName) == 0) {
-            char msg[256] = "";
-            createMessage(msg, "Directory \"", folderName,
-                          "\" deleted successfully.");
-            writeMsg(msg);
-            writeLog(msg);
+            handleError("Directory \"", folderName, "\" deleted successfully.");
         } else {
-            char errMsg[256] = "";
-            createMessage(errMsg, "Directory \"", folderName,
-                          "\" is not empty.");
-            writeMsg(errMsg);
-            writeLog(errMsg);
+            if (!pathExists(folderName)) {
+                handleError("Error: Directory \"", folderName, "\" not found.");
+            } else if (access(folderName, W_OK) != 0) {
+                handleError("Error: Permission denied to delete directory \"", folderName, "\".");
+            } else {
+                handleError("Error: Directory \"", folderName, "\" is not empty.");
+            }
         }
         _exit(0);
     } else {
         wait(NULL);
     }
 }
-
 // Show Logs
 void showLogs() { readFile(LOG_FILE); }
 
