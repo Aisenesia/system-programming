@@ -8,6 +8,9 @@
 
 #define LOG_FILE "log.txt"
 
+
+// Helpers
+
 // function to convert integer to string, required for logging time since stdio
 // is not allowed
 void intToStr(int num, char* str) {
@@ -124,6 +127,16 @@ int pathExists(const char* path) {
     return stat(path, &path_stat) == 0;
 }
 
+// Get File Extension
+const char* getFileExtension(const char* filename) {
+    const char* dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return "";
+    return dot;
+}
+
+
+// File Manager Functions
+
 // Create Directory
 void createDir(const char* arg) {
     struct stat path_stat;
@@ -145,9 +158,15 @@ void createDir(const char* arg) {
 
 // Create File
 void createFile(const char* fileName) {
-    if (pathExists(fileName)) {
-        handleError("Error: File \"", fileName, "\" already exists.");
-        return;
+    struct stat path_stat;
+    if (stat(fileName, &path_stat) == 0) {
+        if (S_ISDIR(path_stat.st_mode)) {
+            handleError("Error: \"", fileName, "\" is a directory.");
+            return;
+        } else {
+            handleError("Error: File \"", fileName, "\" already exists.");
+            return;
+        }
     }
 
     int fd = open(fileName, O_WRONLY | O_CREAT, 0644);
@@ -165,6 +184,7 @@ void createFile(const char* fileName) {
 
     handleError("File \"", fileName, "\" created successfully.");
 }
+
 // List Directory
 void listDir(const char* folderName) {
     struct stat path_stat;
@@ -206,18 +226,15 @@ void listDir(const char* folderName) {
                 write(STDOUT_FILENO, "\n", 1);
             }
         }
+        char msg[256] = "";
+        createMessage(msg, "Directory \"", folderName, "\" listed successfully.");
+        writeLog(msg);
+
         closedir(dir);
         _exit(0);  // Exit child process
     } else {
         wait(NULL);  // Wait for child process to finish
     }
-}
-
-// Get File Extension
-const char* getFileExtension(const char* filename) {
-    const char* dot = strrchr(filename, '.');
-    if (!dot || dot == filename) return "";
-    return dot;
 }
 
 // List Files by Extension
@@ -269,6 +286,14 @@ void listFilesByExtension(const char* folderName, const char* extension) {
             writeMsg(noFilesMsg);
             writeLog(noFilesMsg);
         }
+        else {
+            char msg[256] = "";
+            createMessage(msg, "Files with extension \"", extension,
+                          "\" in Directory \"");
+            strcat(msg, folderName);
+            strcat(msg, "\" listed successfully.");
+            writeLog(msg);
+        }
         closedir(dir);
         _exit(0);
     } else {
@@ -313,7 +338,11 @@ void readFile(const char* fileName) {
     }
 
     char buffer[1024];
-    int bytesRead = read(fd, buffer, sizeof(buffer));
+    int bytesRead;
+    while ((bytesRead = read(fd, buffer, sizeof(buffer))) > 0) {
+        write(STDOUT_FILENO, buffer, bytesRead);
+    }
+
     if (bytesRead < 0) {
         char msg[256] = "";
         createMessage(msg, "Error reading file \"", fileName, "\".");
@@ -324,8 +353,12 @@ void readFile(const char* fileName) {
     }
 
     buffer[bytesRead] = '\0';
-    write(STDOUT_FILENO, buffer, bytesRead);
     write(STDOUT_FILENO, "\n", 1);
+
+    char msg[256] = "";
+    createMessage(msg, "File \"", fileName, "\" read successfully.");
+    writeLog(msg);
+
     close(fd);
 }
 
@@ -461,7 +494,17 @@ void deleteDir(const char* folderName) {
     }
 }
 // Show Logs
-void showLogs() { readFile(LOG_FILE); }
+void showLogs() { 
+    if(access(LOG_FILE, F_OK) != 0) {
+        writeMsg("No logs to show.");
+        return;
+    }
+    readFile(LOG_FILE); 
+
+}
+
+
+// Main Function
 
 // Usage Guide
 void printUsage() {
