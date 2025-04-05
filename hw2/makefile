@@ -10,6 +10,12 @@ compile: 344h2
 344h2: main.c
 	@gcc main.c -o 344h2
 
+grep:
+	@ps aux | grep 344h2
+
+kill:
+	@killall -9 344h2
+
 d:
 	@clear
 	@gcc -g -o deb main.c
