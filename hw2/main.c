@@ -93,16 +93,6 @@ void daemon_signal_handler(int sig) {
 void daemonize(int pipefd[2]) {
     pid_t pid;
 
-    // First fork
-    pid = fork();
-    if (pid < 0) {
-        perror("First fork failed");
-        exit(1);
-    }
-    if (pid > 0) {
-        exit(0); // Parent exits
-    }
-
     // Child becomes session leader
     if (setsid() < 0) {
         perror("setsid failed");
@@ -117,7 +107,6 @@ void daemonize(int pipefd[2]) {
     }
     if (pid > 0) {
         // Intermediate child writes the updated PID to the pipe and exits
-        printf("Daemon PID: %d\n", pid);
         write(pipefd[1], &pid, sizeof(pid));
         close(pipefd[1]);
         exit(0);
@@ -170,7 +159,7 @@ void daemonize(int pipefd[2]) {
 void monitor_children() {
     time_t current_time;
     char buffer[256];
-    sprintf(buffer, "Daemon process started with PID: %d", (int)getpid());
+    sprintf(buffer, "Daemon process started monitoring with PID: %d", (int)getpid());
     log_message(buffer);
 
     while (1) {
@@ -265,7 +254,6 @@ void child2() {
     close(fd);
 
     printf("Child 2: Received result %d\n", result);
-    while (1);
     
 }
 
