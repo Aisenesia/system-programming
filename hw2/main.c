@@ -138,17 +138,23 @@ void daemonize(int pipefd[2]) {
     int null_fd = open("/dev/null", O_RDWR);
     if (null_fd >= 0) {
         dup2(null_fd, STDIN_FILENO);
-
-        int log_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (log_fd >= 0) {
-            dup2(log_fd, STDOUT_FILENO);
-            dup2(log_fd, STDERR_FILENO);
-            close(log_fd);
-        } else {
-            dup2(null_fd, STDOUT_FILENO);
-            dup2(null_fd, STDERR_FILENO);
-        }
         close(null_fd);
+    }
+
+    // Redirect stdout and stderr to the log file
+    int log_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd >= 0) {
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+    } else {
+        // If log file cannot be opened, redirect to /dev/null
+        int fallback_fd = open("/dev/null", O_RDWR);
+        if (fallback_fd >= 0) {
+            dup2(fallback_fd, STDOUT_FILENO);
+            dup2(fallback_fd, STDERR_FILENO);
+            close(fallback_fd);
+        }
     }
 
     // Set up signal handlers
@@ -160,11 +166,12 @@ void daemonize(int pipefd[2]) {
     snprintf(buffer, sizeof(buffer), "Daemon process started with PID: %d", (int)getpid());
     log_message(buffer);
 }
-
 /* Function to monitor child processes */
 void monitor_children() {
     time_t current_time;
     char buffer[256];
+    sprintf(buffer, "Daemon process started with PID: %d", (int)getpid());
+    log_message(buffer);
 
     while (1) {
         current_time = time(NULL);
