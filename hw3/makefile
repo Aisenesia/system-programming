@@ -8,7 +8,7 @@ clear:
 compile: satellite
 
 satellite: satellite.c
-	@gcc satellite.c -o satellite
+	@gcc -Wall -pthread satellite.c -o hw3
 
 satellite2: sat2.c
 	@gcc sat2.c -o satellite
