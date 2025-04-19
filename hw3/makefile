@@ -10,16 +10,13 @@ compile: satellite
 satellite: satellite.c
 	@gcc -Wall -pthread satellite.c -o hw3
 
-satellite2: sat2.c
-	@gcc sat2.c -o satellite
-
 d:
 	@clear
 	@gcc -g -o deb main.c
 	@gdb deb
 
 run: satellite
-	@./satellite 
+	@./hw3 
 
 clean:
-	@rm -f satellite deb
+	@rm -f hw3 deb
