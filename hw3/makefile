@@ -5,17 +5,21 @@ all: clear compile
 clear: 
 	@clear
 
-compile: satellite
+compile: main
 
-satellite: satellite.c
-	@gcc -Wall -pthread satellite.c -o hw3
+main: main.c
+	@gcc -Wall -pthread main.c -o hw3
 
 d:
 	@clear
 	@gcc -g -o deb main.c
 	@gdb deb
+v:
+	@clear
+	@gcc -g -o deb main.c
+	@valgrind --leak-check=full ./deb
 
-run: satellite
+run: main
 	@./hw3 
 
 clean:
