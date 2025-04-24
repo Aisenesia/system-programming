@@ -12,11 +12,9 @@
 // -------------------- Constants --------------------
 
 // Number of engineers available
-#define NUM_ENGINEERS 12
-
-#define BASE_INCREMENT \
-    16  // Sattellite heap is held in well, heap and when full its size is
-        // incremented by this
+#define NUM_ENGINEERS 36
+#define BASE_INCREMENT 16   // Sattellite heap is held in well, heap and when full its size is
+                            // incremented by this
 #define MAX_SATELLITES 1024
 // Number of satellites
 #define NUM_SATELLITES 120
@@ -243,119 +241,119 @@ int main() {
 // -------------------- Function Definitions --------------------
 
 void *engineer(void *arg) {
-    int id = (int)(long)arg;
+    int id = (int)(long)arg; 
 
     while (1) {
-        sem_wait(&newRequest);
+        sem_wait(&newRequest); // Wait for a new request to arrive
 
         pthread_mutex_lock(&engineerMutex);
-
         SatelliteRequest *request = getHighestPrioritySatellite();
         if (request == NULL) {
             pthread_mutex_unlock(&engineerMutex);
-            continue;
+            continue; // No requests to process
         }
 
         pthread_mutex_lock(&handlingMutex);
         if (satelliteBeingHandled[request->satellite_id] == -1) {
+            // Request has timed out, skip processing
             pthread_mutex_unlock(&handlingMutex);
             pthread_mutex_unlock(&engineerMutex);
             free(request);
             continue;
         }
-        satelliteBeingHandled[request->satellite_id] = 1;
+        satelliteBeingHandled[request->satellite_id] = 1; // Mark as being handled
         pthread_mutex_unlock(&handlingMutex);
 
-        availableEngineers--;
-
-        printf("[ENGINEER %d] Handling Satellite %d (Priority %d)\n", id,
-               request->satellite_id, request->priority);
-
+        availableEngineers--; // Decrement available engineers
+        printf("[ENGINEER %d] Handling Satellite %d (Priority %d)\n", id, request->satellite_id, request->priority);
         pthread_mutex_unlock(&engineerMutex);
 
-        int randomTime = rand() % 5 + 1;  // Random time between 1 and 5 seconds
-        sleep(randomTime);
+        sleep(rand () % 5 + 1); // Simulate work
 
-        printf("[ENGINEER %d] Finished Satellite %d\n", id,
-               request->satellite_id);
-
+        printf("[ENGINEER %d] Finished Satellite %d\n", id, request->satellite_id);
         pthread_mutex_lock(&handlingMutex);
-        satelliteBeingHandled[request->satellite_id] = 0;
+        satelliteBeingHandled[request->satellite_id] = 0; // Mark as completed
         pthread_mutex_unlock(&handlingMutex);
 
         pthread_mutex_lock(&engineerMutex);
-        availableEngineers++;
+        availableEngineers++; // Increment available engineers
         pthread_mutex_unlock(&engineerMutex);
 
-        sem_post(&requestHandled);
-
-        free(request);
+        sem_post(&requestHandled); // Signal that the request has been handled
+        free(request); // Free the request memory
     }
 
     return NULL;
 }
 
 void *satellite(void *arg) {
-    int id = (int)(long)arg;
-
+    int id = (int)(long)arg; 
+    
     SatelliteRequest *request = malloc(sizeof(SatelliteRequest));
     if (!request) {
         perror("Failed to allocate memory for SatelliteRequest");
         return NULL;
     }
     request->satellite_id = id;
-    request->priority = rand() % 4 + 1;  // Random priority between 1 and 10
+    request->priority = rand() % 4 + 1; // Random priority between 1 and 4
     request->arrival_time = time(NULL);
 
-    printf("[SATELLITE] Satellite %d requesting (priority %d)\n", id,
-           request->priority);
+    printf("[SATELLITE] Satellite %d requesting (priority %d)\n", id, request->priority);
 
     pthread_mutex_lock(&engineerMutex);
-
-    insertSatelliteIntoQueue(request);
-
+    insertSatelliteIntoQueue(request); // Add request to the priority queue
     pthread_mutex_unlock(&engineerMutex);
 
-    sem_post(&newRequest);
+    sem_post(&newRequest); // Notify engineers of a new request
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += MAX_CONNECTION_WINDOW;
+    ts.tv_sec += MAX_CONNECTION_WINDOW; // Set timeout window
 
     while (1) {
+        pthread_mutex_lock(&engineerMutex);
         pthread_mutex_lock(&handlingMutex);
-        int isBeingHandled = satelliteBeingHandled[id];
-        pthread_mutex_unlock(&handlingMutex);
 
-        if (isBeingHandled) {
-            sem_wait(&requestHandled);
+        int isBeingHandled = satelliteBeingHandled[id];
+        if (isBeingHandled == 1) {
+            // Request is being handled by an engineer
+            pthread_mutex_unlock(&handlingMutex);
+            pthread_mutex_unlock(&engineerMutex);
+            sem_wait(&requestHandled); // Wait for request to be handled
             break;
         }
+
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
         if (now.tv_sec >= ts.tv_sec) {
-            printf("[TIMEOUT] Satellite %d timeout %d seconds.\n", id,
-                   MAX_CONNECTION_WINDOW);
-            pthread_mutex_lock(&engineerMutex); // remove the request from the queue if it hasn't been handled
+            printf("[TIMEOUT] Satellite %d timeout %d seconds.\n", id, MAX_CONNECTION_WINDOW);
+
+            // Remove the request from the queue if it hasn't been handled
             for (int i = 0; i < requestQueue.size; i++) {
                 if (requestQueue.items[i]->satellite_id == id) {
                     SatelliteRequest *timedOutRequest = requestQueue.items[i];
-                    requestQueue.items[i] =
-                        requestQueue.items[--requestQueue.size];
+                    requestQueue.items[i] = requestQueue.items[--requestQueue.size];
                     heapifyDown(&requestQueue, i);
-                    free(timedOutRequest); // free the memory for the timed-out request explicitly
+
+                    if (satelliteBeingHandled[id] == 0) {
+                        // Only free if not being handled
+                        free(timedOutRequest);
+                    }
+
+                    satelliteBeingHandled[id] = -1; // Mark as timed out
                     break;
                 }
             }
-            pthread_mutex_unlock(&engineerMutex);
 
-            pthread_mutex_lock(&handlingMutex);
-            satelliteBeingHandled[id] = -1;  // Mark as timed out
             pthread_mutex_unlock(&handlingMutex);
-
+            pthread_mutex_unlock(&engineerMutex);
             return NULL;
         }
-        sleep(1);  // Small sleep to avoid CPU hogging
+
+        pthread_mutex_unlock(&handlingMutex);
+        pthread_mutex_unlock(&engineerMutex);
+        sleep(1); // Avoid busy-waiting, using usleep and sleeping for 100ms is far better idea
     }
+
     return NULL;
 }
