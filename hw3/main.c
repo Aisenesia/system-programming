@@ -12,12 +12,12 @@
 // -------------------- Constants --------------------
 
 // Number of engineers available
-#define NUM_ENGINEERS 36
+#define NUM_ENGINEERS 3
 #define BASE_INCREMENT 16   // Sattellite heap is held in well, heap and when full its size is
                             // incremented by this
 #define MAX_SATELLITES 1024
 // Number of satellites
-#define NUM_SATELLITES 120
+#define NUM_SATELLITES 5
 
 // Maximum connection window for satellites (in seconds)
 #define MAX_CONNECTION_WINDOW 5
