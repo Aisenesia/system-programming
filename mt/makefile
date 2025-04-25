@@ -15,4 +15,7 @@ client: src/client.c src/common.h
 	$(CC) $(CFLAGS) -o client src/client.c $(LDFLAGS)
 
 clean:
-	rm -f server teller
+	ipcrm -a
+	rm -f ClientFIFO*
+	rm -f ServerFIFO_Name
+	rm -f server teller client

@@ -3,8 +3,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include "common.h"
+
 
 // Reads a client file (A batch job, connect to the server fifo)
 
@@ -29,8 +32,10 @@ N withdraw 20
 
 
 */
+ClientRequest generateRequestFromLine(int clid, char* line);
 
 int main(int argc, char* argv[]) {
+   
     if (argc < 2) {
         printf("Usage: %s <client_file>\n", argv[0]);
         return 1;
@@ -38,68 +43,95 @@ int main(int argc, char* argv[]) {
 
     printf("Reading %s\n", argv[1]);
 
-    // Open the client file
-    FILE *file = fopen(argv[1], "r");
-    if (file == NULL) {
+    // Read the client file
+    FILE* client_file = fopen(argv[1], "r");
+    if (client_file == NULL) {
         perror("Error opening client file");
         return 1;
     }
-
-    // Array to store requests
-    ClientRequest requests[100];
-    int request_count = 0;
-
+    ClientRequest requests[256];
     char line[256];
-    while (fgets(line, sizeof(line), file)) {
-        // Parse the line
-        char clientName[32];
-        char operation[10];
-        int amount;
-        if (sscanf(line, "%s %s %d", clientName, operation, &amount) < 2) {
-            fprintf(stderr, "Invalid line format: %s", line);
+    int line_number = 0;
+    while (fgets(line, sizeof(line), client_file) != NULL) {
+        line_number++;
+        // Skip empty lines
+        if (strlen(line) == 0 || line[0] == '\n') {
             continue;
         }
-
-        // Create a ClientRequest struct
-        ClientRequest req;
-        req.clientID = -1; // Default value for new clients
-        req.op = (strcmp(operation, "deposit") == 0) ? DEPOSIT : WITHDRAW;
-        req.amount = amount;
-        strncpy(req.clientName, clientName, sizeof(req.clientName) - 1);
-        req.clientName[sizeof(req.clientName) - 1] = '\0'; // Ensure null-termination
-        req.clientName[0] = '-'; // name will be given by the server
-
-        // Save the request
-        requests[request_count++] = req;
+        // Generate request from line
+        ClientRequest request = generateRequestFromLine(0, line);
+        printf("Generated request from line %d: %s %s %d\n", line_number, request.bankName, request.operation == DEPOSIT ? "deposit" : "withdraw", request.amount);
+        // Add request to requests array
+        requests[line_number - 1] = request;
     }
-    fclose(file);
+    fclose(client_file);
 
-    printf("Number of clients to be processed: %d\n", request_count);
+    //mkfifo
+    // Create the client FIFO
 
-    // Connect to the server FIFO
+    // read client starting id from server fifo.
+    int client_fifo_fd = open(CLIENT_FIFO, O_RDONLY);
+    if (client_fifo_fd == -1) {
+        perror("client_fifo_fd opening server FIFO");
+        return 1;
+    }
+    int client_id;
+
+    if(read(client_fifo_fd, &client_id, sizeof(client_id)) == -1) {
+        perror("Error writing to client FIFO");
+        close(client_fifo_fd);
+        return 1;
+    }
+
+    close(client_fifo_fd);
+
+    for(int i = 0; i < line_number; i++) {
+        requests[i].clientID = client_id + i;
+    }
+
+    // Open the server FIFO
     int server_fifo_fd = open(SERVER_FIFO, O_WRONLY);
     if (server_fifo_fd == -1) {
         perror("Error opening server FIFO");
         return 1;
     }
-    printf("Connected to Adabank.\n");
-
-    // Process the requests
-    for (int i = 0; i < request_count; i++) {
-        ssize_t bytes_written = write(server_fifo_fd, &requests[i], sizeof(ClientRequest));
-        if (bytes_written == -1) {
+    // Write the requests to the server FIFO
+    if(write(server_fifo_fd, &line_number, sizeof(line_number)) == -1) {
+        perror("Error writing to server FIFO");
+        close(server_fifo_fd);
+        return 1;
+    }
+    for (int i = 0; i < line_number; i++) {
+        if (write(server_fifo_fd, &requests[i], sizeof(ClientRequest)) == -1) {
             perror("Error writing to server FIFO");
             close(server_fifo_fd);
             return 1;
         }
-        printf("Sent request: %s %s %d\n", requests[i].clientName, 
-               (requests[i].op == DEPOSIT) ? "deposit" : "withdraw", 
-               requests[i].amount);
     }
-
-    // Close the server FIFO
     close(server_fifo_fd);
 
+
+
+    // Open the client file
+   
     return 0;
+}
+
+ClientRequest generateRequestFromLine(int clid, char* line) {
+    ClientRequest request;
+    char operation[10];
+    sscanf(line, "%s %s %d", request.bankName, operation, &request.amount);
+    request.clientID = clid;
+    if (strcmp(operation, "deposit") == 0) {
+        request.operation = DEPOSIT;
+    } else if (strcmp(operation, "withdraw") == 0) {
+        request.operation = WITHDRAW;
+    } else {
+        fprintf(stderr, "Unknown operation: %s\n", operation);
+        exit(1);
+    }
+    
+    
+    return request;
 }
 

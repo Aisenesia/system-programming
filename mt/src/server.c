@@ -1,52 +1,59 @@
+#include <fcntl.h>
+#include <semaphore.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <sys/mman.h>
-#include <semaphore.h>
-#include "common.h" // Include the Teller library
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "common.h"  // Include the Teller library
 
 #define DATABASE "adabank.db"
 
 // Function prototypes
 void handle_signal(int sig);
 void cleanup_and_exit();
-void teller_function(void *arg); // Teller function
+void teller_function(void *arg);  // Teller function
 void setup_shared_memory();
 void cleanup_shared_memory();
-int find_client_in_db(const char *clientName, off_t *position, char *buffer, size_t buffer_size);
+int find_client_in_db(const char *bankName, off_t *position, char *buffer,
+                      size_t buffer_size);
 int add_to_db(DatabaseEntry *req);
 int update_db(DatabaseEntry *req);
-int remove_from_db(const char *clientName);
+int remove_from_db(const char *bankName);
+void process_database_operations();
 
 // Global variables
 int server_fifo_fd = -1;
-int teller_id_giver = 0; // both for teller and the client
+int teller_id_giver = 1;  // both for teller and the client
 
 SharedMemory *shared_mem = NULL;
 sem_t *sem_server = NULL;
 sem_t *sem_teller = NULL;
 
 int main() {
-    setup_shared_memory();
+    // setup_shared_memory();
 
     // Register signal handler
     signal(SHUTDOWN_SIGNAL, handle_signal);
+    signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE signal
 
     printf("Adabank is active…\n");
 
-    if (access(LOG_FILE, F_OK) == 0) {
-        printf("Previous logs found. Loading the bank database...\n");
-        // Load the bank database from the log file
-        
+    if (access(DATABASE, F_OK) == 0) {
+        printf("Previous database found. Loading the bank database...\n");
+
     } else {
         printf("No previous logs.. Creating the bank database\n");
-        // create the bank database
-        
+        FILE *db_file = fopen(DATABASE, "w");
+        if (db_file == NULL) {
+            perror("Error creating database file");
+            cleanup_and_exit();
+        }
+        fclose(db_file);
     }
 
     // Create the server FIFO
@@ -56,57 +63,56 @@ int main() {
     }
     printf("Waiting for clients @%s…\n", SERVER_FIFO);
 
-    // Open the server FIFO for reading
-    server_fifo_fd = open(SERVER_FIFO, O_RDONLY);
-    if (server_fifo_fd == -1) {
-        perror("Error opening server FIFO");
+    // Open the server FIFO for writing, always write next client id
+
+    // Create the client FIFO
+    if (mkfifo(CLIENT_FIFO, 0666) == -1) {
+        perror("Error creating client FIFO");
         cleanup_and_exit();
     }
 
-    // Main loop to accept client requests
+    // Main loop to accept client requests and process database operations
     while (1) {
-        ClientRequest req;
-        ssize_t bytes_read = read(server_fifo_fd, &req, sizeof(ClientRequest));
-        if (bytes_read <= 0) {
-            perror("Error reading from FIFO");
-            break;
+        // write the client id to the client fifo
+        int client_fifo_fd = open(CLIENT_FIFO, O_WRONLY);
+        if (client_fifo_fd == -1) {
+            perror("Error opening client FIFO");
+            cleanup_and_exit();
         }
-
-        // Assign a unique client ID for the request
-        teller_id_giver++;
-        req.clientID = teller_id_giver;
-
-        printf("Received request from client ID: %d\n", req.clientID);
-
-        // Handle new accounts (bankID generation)
-        if (req.clientName[0] == 'N') {
-            snprintf(req.clientName, sizeof(req.clientName), "BankID_%02d", teller_id_giver);
-            printf("New bank account created: %s\n", req.clientName);
+        if (write(client_fifo_fd, &teller_id_giver, sizeof(teller_id_giver)) ==
+            -1) {
+            perror("Error writing to server FIFO");
+            close(client_fifo_fd);
+            cleanup_and_exit();
         }
-
-        // Write the request to shared memory
-        sem_wait(sem_server);
-        shared_mem->request = req;
-        shared_mem->processed = 0;
-        sem_post(sem_teller);
-
-        // Execute the teller program
-        pid_t teller_pid = fork();
-        if (teller_pid == 0) {
-            // Child process: Execute the teller program
-            execl("./teller", "teller", NULL);
-            perror("Error executing teller program");
-            exit(1);
-        } else if (teller_pid < 0) {
-            perror("Error forking teller process");
+        int number_of_clients = 0;
+        // Read the client request from the FIFO
+        server_fifo_fd = open(SERVER_FIFO, O_RDONLY);
+        if (server_fifo_fd == -1) {
+            perror("Error opening server FIFO");
+            cleanup_and_exit();
         }
-
-        // Wait for the teller to process the request
-        sem_wait(sem_server);
-        if (shared_mem->processed) {
-            printf("Processed request for client ID: %d\n", req.clientID);
+        if (read(server_fifo_fd, &number_of_clients,
+                 sizeof(number_of_clients)) == -1) {
+            perror("Error reading from server FIFO");
+            close(client_fifo_fd);
+            cleanup_and_exit();
         }
-        sem_post(sem_server);
+        printf("Number of clients: %d\n", number_of_clients);
+
+        for (int i = 0; i < number_of_clients; i++) {
+            ClientRequest request;
+            if (read(server_fifo_fd, &request, sizeof(request)) == -1) {
+                perror("Error reading from server FIFO");
+                close(client_fifo_fd);
+                cleanup_and_exit();
+            }
+            printf("Received request from client %d: %s %s %d\n",
+                   request.clientID, request.bankName,
+                   request.operation == DEPOSIT ? "deposit" : "withdraw",
+                   request.amount);
+                   teller_id_giver++;
+        }
     }
 
     cleanup_and_exit();
@@ -128,7 +134,8 @@ void setup_shared_memory() {
     }
 
     // Map the shared memory
-    shared_mem = mmap(NULL, sizeof(SharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    shared_mem = mmap(NULL, sizeof(SharedMemory), PROT_READ | PROT_WRITE,
+                      MAP_SHARED, shm_fd, 0);
     if (shared_mem == MAP_FAILED) {
         perror("Error mapping shared memory");
         exit(1);
@@ -155,51 +162,6 @@ void cleanup_shared_memory() {
     munmap(shared_mem, sizeof(SharedMemory));
 }
 
-// Teller function to handle client requests
-void teller_function(void *arg) {
-    while (1) {
-        sem_wait(sem_teller);
-
-        // Read request from shared memory
-        ClientRequest *req = &shared_mem->request;
-
-        printf("Teller PID%02d is processing request for client: %s\n", getpid(), req->clientName);
-
-        if (req->op == DEPOSIT) {
-            DatabaseEntry entry;
-            strncpy(entry.clientName, req->clientName, sizeof(entry.clientName) - 1);
-            entry.clientName[sizeof(entry.clientName) - 1] = '\0'; // Ensure null-termination
-            entry.id = req->clientID;
-            entry.balance = req->amount;
-
-            printf("%s deposited %d credits… updating log\n", req->clientName, req->amount);
-            add_to_db(&entry);
-        } else if (req->op == WITHDRAW) {
-            DatabaseEntry entry;
-            strncpy(entry.clientName, req->clientName, sizeof(entry.clientName) - 1);
-            entry.clientName[sizeof(entry.clientName) - 1] = '\0'; // Ensure null-termination
-            entry.id = req->clientID;
-            entry.balance = 0;
-
-            printf("%s withdraws %d credits… ", req->clientName, req->amount);
-            if (find_client_in_db(req->clientName, NULL, NULL, 0) != -1) {
-                entry.balance -= req->amount;
-                if (entry.balance >= 0) {
-                    printf("updating log\n");
-                    update_db(&entry);
-                } else {
-                    printf("operation not permitted.\n");
-                }
-            } else {
-                printf("operation not permitted.\n");
-            }
-        }
-
-        shared_mem->processed = 1;
-        sem_post(sem_server);
-    }
-}
-
 // Signal handler for graceful shutdown
 void handle_signal(int sig) {
     printf("Signal received closing active Tellers\n");
@@ -211,7 +173,8 @@ void cleanup_and_exit() {
     if (server_fifo_fd != -1) {
         close(server_fifo_fd);
     }
-    unlink(SERVER_FIFO); // Remove the FIFO
+    unlink(SERVER_FIFO);  // Remove the FIFO
+    unlink(CLIENT_FIFO);  // Remove the FIFO
     cleanup_shared_memory();
     printf("Removing ServerFIFO… Updating log file…\n");
     printf("Adabank says “Bye”…\n");
@@ -219,7 +182,8 @@ void cleanup_and_exit() {
 }
 
 // Helper function to find a client in the database and return its position
-int find_client_in_db(const char *clientName, off_t *position, char *buffer, size_t buffer_size) {
+int find_client_in_db(const char *bankName, off_t *position, char *buffer,
+                      size_t buffer_size) {
     int db_fd = open(DATABASE, O_RDWR);
     if (db_fd == -1) {
         perror("Error opening database");
@@ -228,16 +192,16 @@ int find_client_in_db(const char *clientName, off_t *position, char *buffer, siz
 
     off_t offset = 0;
     while (read(db_fd, buffer, buffer_size) > 0) {
-        if (strstr(buffer, clientName) != NULL) {
+        if (strstr(buffer, bankName) != NULL) {
             *position = offset;
             close(db_fd);
-            return db_fd; // Return the file descriptor for further operations
+            return db_fd;  // Return the file descriptor for further operations
         }
         offset += strlen(buffer);
     }
 
     close(db_fd);
-    return -1; // Client not found
+    return -1;  // Client not found
 }
 
 int add_to_db(DatabaseEntry *req) {
@@ -248,7 +212,7 @@ int add_to_db(DatabaseEntry *req) {
     }
 
     char buffer[256];
-    sprintf(buffer, "%s %d %d\n", req->clientName, req->id, req->balance);
+    sprintf(buffer, "%s %d %d\n", req->bankName, req->id, req->balance);
     if (write(db_fd, buffer, strlen(buffer)) == -1) {
         perror("Error writing to database");
         close(db_fd);
@@ -256,19 +220,20 @@ int add_to_db(DatabaseEntry *req) {
     }
 
     close(db_fd);
-    return 0; // Success
+    return 0;  // Success
 }
 
 int update_db(DatabaseEntry *req) {
     char buffer[256];
     off_t position;
-    int db_fd = find_client_in_db(req->clientName, &position, buffer, sizeof(buffer));
+    int db_fd =
+        find_client_in_db(req->bankName, &position, buffer, sizeof(buffer));
     if (db_fd == -1) {
-        return -1; // Client not found
+        return -1;  // Client not found
     }
 
     lseek(db_fd, position, SEEK_SET);
-    sprintf(buffer, "%s %d %d\n", req->clientName, req->id, req->balance);
+    sprintf(buffer, "%s %d %d\n", req->bankName, req->id, req->balance);
     if (write(db_fd, buffer, strlen(buffer)) == -1) {
         perror("Error writing to database");
         close(db_fd);
@@ -276,15 +241,15 @@ int update_db(DatabaseEntry *req) {
     }
 
     close(db_fd);
-    return 0; // Success
+    return 0;  // Success
 }
 
-int remove_from_db(const char *clientName) {
+int remove_from_db(const char *bankName) {
     char buffer[256];
     off_t position;
-    int db_fd = find_client_in_db(clientName, &position, buffer, sizeof(buffer));
+    int db_fd = find_client_in_db(bankName, &position, buffer, sizeof(buffer));
     if (db_fd == -1) {
-        return -1; // Client not found
+        return -1;  // Client not found
     }
 
     FILE *temp_file = fopen("temp.db", "w");
@@ -296,7 +261,7 @@ int remove_from_db(const char *clientName) {
 
     lseek(db_fd, 0, SEEK_SET);
     while (read(db_fd, buffer, sizeof(buffer)) > 0) {
-        if (strstr(buffer, clientName) == NULL) {
+        if (strstr(buffer, bankName) == NULL) {
             fwrite(buffer, 1, strlen(buffer), temp_file);
         }
     }
@@ -308,6 +273,5 @@ int remove_from_db(const char *clientName) {
     remove(DATABASE);
     rename("temp.db", DATABASE);
 
-    return 0; // Success
+    return 0;  // Success
 }
-
