@@ -11,12 +11,12 @@
 
 #include "common.h"  // Include the Teller library
 
-#define DATABASE "adabank.db"
+#define DATABASE "files/adabank.db"
 
 // Function prototypes
 void handle_signal(int sig);
 void cleanup_and_exit();
-void teller_function(void *arg);  // Teller function
+void teller_function();  // Teller function
 void setup_shared_memory();
 void cleanup_shared_memory();
 int find_client_in_db(const char *bankName, off_t *position, char *buffer,
@@ -25,6 +25,9 @@ int add_to_db(DatabaseEntry *req);
 int update_db(DatabaseEntry *req);
 int remove_from_db(const char *bankName);
 void process_database_operations();
+void *deposit(void *arg);
+void *withdraw(void *arg);
+
 
 // Global variables
 int server_fifo_fd = -1;
@@ -112,12 +115,54 @@ int main() {
                    request.operation == DEPOSIT ? "deposit" : "withdraw",
                    request.amount);
                    teller_id_giver++;
+            // Create a new teller process
+            teller_function(&request);
+
         }
     }
 
     cleanup_and_exit();
     return 0;
 }
+
+// teller main function
+
+void teller_function(ClientRequest *request) {
+    // Determine the operation type, check db for the client, if N create a new client, call Teller(deposit/withdraw)
+    if (request->operation == DEPOSIT) {
+        // Create a new process for deposit operation
+        pid_t teller_pid = Teller(deposit, request);
+        if (teller_pid == -1) {
+            perror("Error creating deposit teller process");
+            return;
+        }
+        waitTeller(teller_pid, NULL);  // Wait for the teller process to finish
+    } else if (request->operation == WITHDRAW) {
+        // Create a new process for withdraw operation
+        pid_t teller_pid = Teller(withdraw, request);
+        if (teller_pid == -1) {
+            perror("Error creating withdraw teller process");
+            return;
+        }
+        waitTeller(teller_pid, NULL);  // Wait for the teller process to finish
+    } else {
+        fprintf(stderr, "Invalid operation type\n");
+    }
+}
+
+void* deposit(void* arg) {
+    // Cases: bankName is N, bankName is a valid bank name that exists in the database, bankName is a valid bank name that does not exist in the database
+    // Flow: using shared memory, 
+}
+void* withdraw(void* arg) {
+    // cases:
+    // 1. bankName is N or another Invalid name - Fail (new client cannot withdraw so might as well just give error)
+    // 2. bankName is a valid bank name that exists in the database with sufficient balance - Success
+    // 3. bankName is a valid bank name that exists in the database with insufficient balance - Fail
+    // 4. balance after withdraw is 0 - remove the client from the database
+    // Flow: using shared memory, 
+}
+
 
 void setup_shared_memory() {
     // Create shared memory object

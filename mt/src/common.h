@@ -26,31 +26,9 @@
 // Signal macros
 #define SHUTDOWN_SIGNAL SIGINT
 
-// Teller function prototype
-typedef void (*TellerFunc)(void *arg); // Function pointer type for Teller
 
-
-
-pid_t Teller(void (*func)(void *), void *arg_func) {
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("Error creating process");
-        return -1;
-    }
-
-    if (pid == 0) {
-        // Child process
-        func(arg_func); // Execute the function passed as argument
-        exit(0); // Exit after execution
-    }
-
-    // Parent process
-    return pid;
-}
-
-int waitTeller(pid_t pid, int *status) {
-    return waitpid(pid, status, 0); // Wait for the specific child process
-}
+pid_t Teller(void *func, void *arg);
+int waitTeller(pid_t pid, int* status);
 
 typedef enum {
     DEPOSIT,
