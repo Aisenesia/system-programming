@@ -43,10 +43,25 @@ typedef struct {
 
 typedef struct {
     OperationType operation;
-    int result; // Result of the operation
+    int transaction_id;  // ID for tracking this request
+    int result;          // Result of the operation
     DatabaseEntry entry; // Database entry for the operation
 } DatabaseCommand;
 
+
+// Add this to SharedMemory struct
+typedef struct {
+    sem_t sem;           // Semaphore for this transaction
+    int completed;       // Whether the transaction is completed
+    int result;          // Result of the transaction
+    void* data;          // Additional data if needed
+} TransactionRecord;
+
+typedef struct {
+    TransactionRecord transactions[MAX_QUEUE_SIZE];
+    int transaction_count;
+    sem_t mutex;         // Protect access to the transaction array
+} TransactionManager;
 
 typedef struct {
     DatabaseCommand commands[MAX_QUEUE_SIZE]; // Array of commands
@@ -82,6 +97,7 @@ typedef struct {
     int processed; // 0 = not processed, 1 = processed
     int result [128];    // Result of the operation (e.g., success or failure)
     CommandQueue dbQueue; // Queue for database operations
+    TransactionManager transactionManager; // Transaction manager
 } SharedMemory;
 
 

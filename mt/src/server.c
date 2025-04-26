@@ -5,18 +5,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#include <sys/select.h>
 
 #include "common.h"  // Include the Teller library
 
 #define DATABASE "files/adabank.db"
 
 #define TELLER_DEBUG_FILE "files/teller_debug.txt"
-FILE* teller_debug_file = NULL;
+FILE *teller_debug_file = NULL;
 
 // Function prototypes
 void handle_signal(int sig);
@@ -33,6 +32,16 @@ int remove_from_db(const char *bankName);
 void process_database_operations();
 int get_available_bank_name();
 
+void setup_transaction_manager();
+int process_deposit(DatabaseCommand *cmd, int *new_balance);
+int process_withdraw(DatabaseCommand *cmd, int *new_balance);
+int allocate_transaction();
+int wait_for_transaction(int transaction_id);
+
+int add_db_command(CommandQueue *queue, DatabaseCommand *cmd);
+
+int get_db_command(CommandQueue *queue, DatabaseCommand *cmd);
+
 void *deposit(void *arg);
 void *withdraw(void *arg);
 
@@ -47,6 +56,7 @@ sem_t *sem_db_dependency = NULL;
 
 int main() {
     setup_shared_memory();
+    setup_transaction_manager();  // Initialize our new transaction system
 
     // Register signal handler
     signal(SHUTDOWN_SIGNAL, handle_signal);
@@ -54,7 +64,7 @@ int main() {
 
     // Open the debug file
     teller_debug_file = fopen(TELLER_DEBUG_FILE, "a");
-    
+
     printf("Adabank is active…\n");
 
     if (access(DATABASE, F_OK) == 0) {
@@ -83,106 +93,156 @@ int main() {
         cleanup_and_exit();
     }
 
-    // Main loop to accept client requests and process database operations
+    // Main server loop
     while (1) {
-        // Check for pending database operations first
-        if (shared_mem->dbQueue.count > 0) {
-            printf("Processing pending database operations...\n");
-            process_database_operations();
-            continue; // Process all DB operations before handling new clients
-        }
-    
-        // Try to handle client requests without blocking
-        // Set up for select to check if CLIENT_FIFO is ready for writing
+        // First, process any pending database operations
+        process_database_operations();
+
+        // Handle client connections similar to original code
+        // Try to open client FIFO non-blocking
         int client_fifo_fd = open(CLIENT_FIFO, O_WRONLY | O_NONBLOCK);
         if (client_fifo_fd == -1) {
             if (errno == ENXIO) {
                 // No readers on the FIFO yet, wait briefly and try again
-                usleep(10000); // 10ms
+                usleep(10000);  // 10ms
                 continue;
             } else {
                 perror("Error opening client FIFO");
                 cleanup_and_exit();
             }
         }
-    
-        // Prepare for select on client FIFO
+
+        // Use select to check if client FIFO is ready for writing
         fd_set write_fds;
         FD_ZERO(&write_fds);
         FD_SET(client_fifo_fd, &write_fds);
-        
-        // Use select with a timeout to check if writing would block
+
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 10000; // 100ms timeout
-        
+        tv.tv_usec = 10000;  // 10ms timeout
+
         int ready = select(client_fifo_fd + 1, NULL, &write_fds, NULL, &tv);
-        if (ready == -1) {
-            perror("Error in select");
-            close(client_fifo_fd);
-            cleanup_and_exit();
-        } else if (ready == 0) {
-            // Timeout occurred, no client ready to read
+        if (ready <= 0) {
+            // Error or timeout, close and continue
             close(client_fifo_fd);
             continue;
         }
-        
-        // If we get here, CLIENT_FIFO is ready for writing
-        if (FD_ISSET(client_fifo_fd, &write_fds)) {
-            // Write the next client ID
-            if (write(client_fifo_fd, &teller_id_giver, sizeof(teller_id_giver)) == -1) {
-                perror("Error writing to client FIFO");
-                close(client_fifo_fd);
-                cleanup_and_exit();
-            }
+
+        // Write the next client ID and process client requests
+        if (write(client_fifo_fd, &teller_id_giver, sizeof(teller_id_giver)) ==
+            -1) {
+            perror("Error writing to client FIFO");
             close(client_fifo_fd);
-            
-            // Now open the server FIFO to get the client's request
-            server_fifo_fd = open(SERVER_FIFO, O_RDONLY);
-            if (server_fifo_fd == -1) {
-                perror("Error opening server FIFO");
-                cleanup_and_exit();
-            }
-            
-            // Read the number of clients
-            int number_of_clients = 0;
-            if (read(server_fifo_fd, &number_of_clients, sizeof(number_of_clients)) == -1) {
-                perror("Error reading from server FIFO");
-                close(server_fifo_fd);
-                cleanup_and_exit();
-            }
-            printf("Number of clients: %d\n", number_of_clients);
-            
-            // Process each client request
-            for (int i = 0; i < number_of_clients; i++) {
-                ClientRequest request;
-                if (read(server_fifo_fd, &request, sizeof(request)) == -1) {
-                    perror("Error reading from server FIFO");
-                    close(server_fifo_fd);
-                    cleanup_and_exit();
-                }
-                printf("Received request from client %d: %s %s %d\n",
-                      request.clientID, request.bankName,
-                      request.operation == DEPOSIT ? "deposit" : "withdraw",
-                      request.amount);
-                teller_id_giver++;
-                // Create a new teller process to handle this request
-                teller_function(&request);
-            }
-            
+            continue;
+        }
+        close(client_fifo_fd);
+
+        // Open server FIFO to read client requests
+        server_fifo_fd = open(SERVER_FIFO, O_RDONLY);
+        if (server_fifo_fd == -1) {
+            perror("Error opening server FIFO");
+            continue;
+        }
+
+        // Read and process client requests
+        int number_of_clients = 0;
+        if (read(server_fifo_fd, &number_of_clients,
+                 sizeof(number_of_clients)) == -1) {
+            perror("Error reading from server FIFO");
             close(server_fifo_fd);
+            continue;
         }
-        
-        // Always check for database operations after processing client requests
-        if (shared_mem->dbQueue.count > 0) {
-            process_database_operations();
+
+        // Process each client request
+        for (int i = 0; i < number_of_clients; i++) {
+            ClientRequest request;
+            if (read(server_fifo_fd, &request, sizeof(request)) == -1) {
+                perror("Error reading from server FIFO");
+                break;
+            }
+
+            printf("Received request from client %d: %s %s %d\n",
+                   request.clientID, request.bankName,
+                   request.operation == DEPOSIT ? "deposit" : "withdraw",
+                   request.amount);
+
+            teller_id_giver++;
+            teller_function(&request);
         }
+
+        close(server_fifo_fd);
+
+        // Check again for database operations before next loop iteration
+        process_database_operations();
     }
+
     cleanup_and_exit();
     return 0;
-}  
+}
 
+void setup_transaction_manager() {
+    // Initialize the transaction manager mutex
+    sem_init(&shared_mem->transactionManager.mutex, 1, 1);
 
+    // Initialize all transaction semaphores
+    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+        sem_init(&shared_mem->transactionManager.transactions[i].sem, 1, 0);
+        shared_mem->transactionManager.transactions[i].completed =
+            1;  // Mark as available
+    }
+
+    shared_mem->transactionManager.transaction_count = 0;
+}
+
+// Allocate a transaction record
+int allocate_transaction() {
+    int transaction_id = -1;
+
+    sem_wait(&shared_mem->transactionManager.mutex);
+
+    // Find an available transaction slot
+    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+        if (shared_mem->transactionManager.transactions[i].completed) {
+            shared_mem->transactionManager.transactions[i].completed = 0;
+            shared_mem->transactionManager.transactions[i].result =
+                -2;  // Pending
+            transaction_id = i;
+            break;
+        }
+    }
+
+    sem_post(&shared_mem->transactionManager.mutex);
+    return transaction_id;
+}
+
+// Complete a transaction
+void complete_transaction(int transaction_id, int result) {
+    if (transaction_id < 0 || transaction_id >= MAX_QUEUE_SIZE) return;
+
+    sem_wait(&shared_mem->transactionManager.mutex);
+
+    shared_mem->transactionManager.transactions[transaction_id].result = result;
+    shared_mem->transactionManager.transactions[transaction_id].completed = 1;
+
+    // Signal that the transaction is complete
+    sem_post(&shared_mem->transactionManager.transactions[transaction_id].sem);
+
+    sem_post(&shared_mem->transactionManager.mutex);
+}
+
+// Wait for a transaction to complete
+int wait_for_transaction(int transaction_id) {
+    if (transaction_id < 0 || transaction_id >= MAX_QUEUE_SIZE) return -1;
+
+    // Wait for the transaction to complete
+    sem_wait(&shared_mem->transactionManager.transactions[transaction_id].sem);
+
+    // Get the result
+    int result =
+        shared_mem->transactionManager.transactions[transaction_id].result;
+
+    return result;
+}
 
 // teller main function
 
@@ -217,12 +277,9 @@ void *deposit(void *arg) {
     ClientRequest *request = (ClientRequest *)arg;
     ServerResponse response;
     char teller_fifo[64];
-    printf("Teller %d: Processing deposit request for %s\n", request->clientID,
-           request->bankName);
 
     // Create a unique FIFO for this teller
     sprintf(teller_fifo, "%s_%d", CLIENT_FIFO, request->clientID);
-    printf("Dumping to fifo: %s\n", teller_fifo);
 
     // Create the teller's response FIFO
     if (mkfifo(teller_fifo, 0666) == -1) {
@@ -235,101 +292,67 @@ void *deposit(void *arg) {
     response.balance = 0;
     strcpy(response.message, "");
 
-    // Prepare database command
-    DatabaseCommand cmd;
-    cmd.operation = DEPOSIT;
-    strcpy(cmd.entry.bankName, request->bankName);  // this is wrong. TODO.
-    cmd.entry.id = request->clientID;
-    cmd.entry.balance = request->amount;  // For deposit, this is amount to add
-
-    // Acquire server semaphore to modify shared memory
-    if (sem_wait(sem_server) == -1) {
-        perror("Error waiting for server semaphore");
-        unlink(teller_fifo);
-        return NULL;
-    }
-
-    // Add command to shared memory
-    shared_mem->request = *request;
-    shared_mem->processed = 0;
-
-    // Add command to database operation queue
-    if (shared_mem->dbQueue.count < MAX_QUEUE_SIZE) {
-        int tail = shared_mem->dbQueue.tail;
-        shared_mem->dbQueue.commands[tail] = cmd;
-        shared_mem->dbQueue.tail = (tail + 1) % MAX_QUEUE_SIZE;
-        shared_mem->dbQueue.count++;
-    } else {
-        strcpy(response.message, "Database operation queue is full");
-        sem_post(sem_server);
+    // Allocate a transaction record
+    int transaction_id = allocate_transaction();
+    if (transaction_id == -1) {
+        strcpy(response.message, "System busy, try again later");
         goto send_response;
     }
 
-    // Signal the server to process the database operation
-    sem_post(sem_server);
+    // Prepare database command
+    DatabaseCommand cmd;
+    cmd.operation = DEPOSIT;
+    cmd.transaction_id = transaction_id;
+    strcpy(cmd.entry.bankName, request->bankName);
+    cmd.entry.id = request->clientID;
+    cmd.entry.balance = request->amount;
 
-    // Wait for server to process the request
-    if (sem_wait(sem_teller) == -1) {
-        perror("Error waiting for teller semaphore");
-        unlink(teller_fifo);
-        return NULL;
+    // Add debug log to track semaphore and queue state
+    printf(
+        "DEBUG: Attempting to add command to queue. Current queue count: %d, "
+        "head: %d, tail: %d\n",
+        shared_mem->dbQueue.count, shared_mem->dbQueue.head,
+        shared_mem->dbQueue.tail);
+
+    // Add the command to the queue
+    if (!add_db_command(&shared_mem->dbQueue, &cmd)) {
+        strcpy(response.message, "Database operation queue is full");
+        // Fix the sem_getvalue call by providing a valid pointer to an integer
+        int sem_value;
+        printf("DEBUG: Queue full. Semaphore spaces value: %d\n",
+               sem_getvalue(&shared_mem->dbQueue.spaces, &sem_value));
+        complete_transaction(transaction_id, -1);  // Mark as failed
+        goto send_response;
     }
 
-    // Check if the operation was successful
-    // Modify the response handling in the deposit function:
-    while (!shared_mem->processed) {
-        if (cmd.result != -1) {
-            // Success
-            fprintf(teller_debug_file, "Teller %d: Deposit successful\n", request->clientID);
-            response.bankID = cmd.result;  // Bank ID
-            response.success = 1;
-            response.balance = shared_mem->request.amount;  // Updated balance
-            sprintf(response.message,
-                    "%s has been created. %d$ has been added.",
-                    request->bankName, request->amount);
-        } else {
-            // Failed
-            fprintf(teller_debug_file,"Teller %d: Deposit failed\n", request->clientID);
-            response.success = 0;
-            if (strcmp(request->bankName, "N") == 0) {
-                sprintf(response.message,
-                        "Failed to create new account and deposit %d$",
-                        request->amount);
-            } else {
-                sprintf(response.message, "Failed to deposit %d$ to %s",
-                        request->amount, request->bankName);
-            }
-        }
-    }
+    // Wait for the operation to complete
+    int result = wait_for_transaction(transaction_id);
 
-    // Release teller semaphore
-    sem_post(sem_teller);
+    // Check if operation was successful
+    if (result != -1) {
+        // Success
+        response.success = 1;
+        response.balance = result;  // Updated balance
+        sprintf(response.message, "%s operation successful. New balance: %d$",
+                request->operation == DEPOSIT ? "Deposit" : "Withdrawal",
+                response.balance);
+    } else {
+        // Failed
+        response.success = 0;
+        sprintf(response.message, "Failed to process %s operation",
+                request->operation == DEPOSIT ? "deposit" : "withdrawal");
+    }
 
 send_response:
-    // Open the teller FIFO to send the response
-    printf("Teller %d: Sending response to FIFO %s\n", request->clientID,
-           teller_fifo);
+    // Send the response through the FIFO
     int teller_fd = open(teller_fifo, O_WRONLY);
-    if (teller_fd == -1) {
-        perror("Error opening teller FIFO");
-        unlink(teller_fifo);
-        return NULL;
-    }
-    printf("Teller %d: Writing response to FIFO %s\n", request->clientID,
-           teller_fifo);
-
-    // Send the response
-    if (write(teller_fd, &response, sizeof(response)) == -1) {
-        perror("Error writing to teller FIFO");
+    if (teller_fd != -1) {
+        write(teller_fd, &response, sizeof(response));
+        close(teller_fd);
     }
 
     // Cleanup
-    close(teller_fd);
     unlink(teller_fifo);
-
-    printf("Teller %d: Processed deposit request for %s\n", request->clientID,
-           request->bankName);
-
     return NULL;
 }
 
@@ -337,11 +360,9 @@ void *withdraw(void *arg) {
     ClientRequest *request = (ClientRequest *)arg;
     ServerResponse response;
     char teller_fifo[64];
-    printf("Teller %d: Processing withdraw request for %s\n", request->clientID, request->bankName);
 
     // Create a unique FIFO for this teller
     sprintf(teller_fifo, "%s_%d", CLIENT_FIFO, request->clientID);
-    printf("Dumping to fifo: %s\n", teller_fifo);
 
     // Create the teller's response FIFO
     if (mkfifo(teller_fifo, 0666) == -1) {
@@ -354,216 +375,215 @@ void *withdraw(void *arg) {
     response.balance = 0;
     strcpy(response.message, "");
 
-    if(strcmp(request->bankName, "N") == 0) {
-        strcpy(response.message, "Cannot withdraw from a new account");
+    // Allocate a transaction record
+    int transaction_id = allocate_transaction();
+    if (transaction_id == -1) {
+        strcpy(response.message, "System busy, try again later");
         goto send_response;
     }
 
     // Prepare database command
     DatabaseCommand cmd;
     cmd.operation = WITHDRAW;
+    cmd.transaction_id = transaction_id;
     strcpy(cmd.entry.bankName, request->bankName);
     cmd.entry.id = request->clientID;
-    cmd.entry.balance = request->amount;  // For withdraw, this is amount to subtract
+    cmd.entry.balance = request->amount;
 
-    // Acquire server semaphore to modify shared memory
-    if (sem_wait(sem_server) == -1) {
-        perror("Error waiting for server semaphore");
-        unlink(teller_fifo);
-        return NULL;
-    }
+    // Add debug log to track semaphore and queue state
+    printf(
+        "DEBUG: Attempting to add command to queue. Current queue count: %d, "
+        "head: %d, tail: %d\n",
+        shared_mem->dbQueue.count, shared_mem->dbQueue.head,
+        shared_mem->dbQueue.tail);
 
-    // Add command to shared memory
-    shared_mem->request = *request;
-    shared_mem->processed = 0;
+    // Add the command to the queue
 
-    // Add command to database operation queue
-    if (shared_mem->dbQueue.count < MAX_QUEUE_SIZE) {
-        int tail = shared_mem->dbQueue.tail;
-        shared_mem->dbQueue.commands[tail] = cmd;
-        shared_mem->dbQueue.tail = (tail + 1) % MAX_QUEUE_SIZE;
-        shared_mem->dbQueue.count++;
-    } else {
+    if (!add_db_command(&shared_mem->dbQueue, &cmd)) {
         strcpy(response.message, "Database operation queue is full");
-        sem_post(sem_server);
+        // Fix the sem_getvalue call by providing a valid pointer to an integer
+        int sem_value;
+        printf("DEBUG: Queue full. Semaphore spaces value: %d\n",
+               sem_getvalue(&shared_mem->dbQueue.spaces, &sem_value));
+        complete_transaction(transaction_id, -1);  // Mark as failed
         goto send_response;
     }
 
-    // Signal the server to process the database operation
-    sem_post(sem_server);
+    // Wait for the operation to complete
+    int result = wait_for_transaction(transaction_id);
 
-    // Wait for server to process the request
-    if (sem_wait(sem_teller) == -1) {
-        perror("Error waiting for teller semaphore");
-        unlink(teller_fifo);
-        return NULL;
+    // Check if operation was successful
+    if (result != -1) {
+        // Success
+        response.success = 1;
+        response.balance = result;  // Updated balance
+        sprintf(response.message, "%s operation successful. New balance: %d$",
+                request->operation == DEPOSIT ? "Deposit" : "Withdrawal",
+                response.balance);
+    } else {
+        // Failed
+        response.success = 0;
+        sprintf(response.message, "Failed to process %s operation",
+                request->operation == DEPOSIT ? "deposit" : "withdrawal");
     }
-
-    // Check if the operation was successful
-    while (!shared_mem->processed) {
-        if (cmd.result != -1) {
-            // Success
-            fprintf(teller_debug_file, "Teller %d: Withdraw successful\n", request->clientID);
-            response.bankID = cmd.result;  // Bank ID
-            response.success = 1;
-            response.balance = shared_mem->request.amount;  // Updated balance
-            sprintf(response.message,
-                    "%d$ has been withdrawn from %s. Remaining balance: %d$",
-                    request->amount, request->bankName, response.balance);
-        } else {
-            // Failed
-            fprintf(teller_debug_file, "Teller %d: Withdraw failed\n", request->clientID);
-            response.success = 0;
-            sprintf(response.message, "Failed to withdraw %d$ from %s",
-                    request->amount, request->bankName);
-        }
-    }
-
-    // Release teller semaphore
-    sem_post(sem_teller);
 
 send_response:
-    // Open the teller FIFO to send the response
-    printf("Teller %d: Sending response to FIFO %s\n", request->clientID,
-           teller_fifo);
+    // Send the response through the FIFO
     int teller_fd = open(teller_fifo, O_WRONLY);
-    if (teller_fd == -1) {
-        perror("Error opening teller FIFO");
-        unlink(teller_fifo);
-        return NULL;
-    }
-    printf("Teller %d: Writing response to FIFO %s\n", request->clientID,
-           teller_fifo);
-
-    // Send the response
-    if (write(teller_fd, &response, sizeof(response)) == -1) {
-        perror("Error writing to teller FIFO");
+    if (teller_fd != -1) {
+        write(teller_fd, &response, sizeof(response));
+        close(teller_fd);
     }
 
     // Cleanup
-    close(teller_fd);
     unlink(teller_fifo);
-
-    printf("Teller %d: Processed withdraw request for %s\n", request->clientID,
-           request->bankName);
-
     return NULL;
 }
 
-void process_database_operations() {
-    if (sem_wait(sem_server) == -1) {
-        perror("Error waiting for server semaphore");
-        return;
+// Add a command to the database queue
+// Returns 1 on success, 0 on failure
+int add_db_command(CommandQueue *queue, DatabaseCommand *cmd) {
+    // Try to acquire the spaces semaphore
+    if (sem_trywait(&queue->spaces) == -1) {
+        if (errno == EAGAIN) {
+            return 0;  // Queue is full
+        }
+        perror("Error waiting for spaces semaphore");
+        return 0;  // Error occurred
     }
 
-    // Check if there are any operations in the queue
-    if (shared_mem->dbQueue.count > 0) {
-        // Get the next command from the queue
-        DatabaseCommand cmd =
-            shared_mem->dbQueue.commands[shared_mem->dbQueue.head];
-        shared_mem->dbQueue.head =
-            (shared_mem->dbQueue.head + 1) % MAX_QUEUE_SIZE;
-        shared_mem->dbQueue.count--;
+    // Acquire the mutex
+    sem_wait(&queue->mutex);
 
-        // Process the command based on its operation type
+    // Add the command to the queue
+    queue->commands[queue->tail] = *cmd;
+    queue->tail = (queue->tail + 1) % MAX_QUEUE_SIZE;
+    queue->count++;
+
+    // Release the mutex
+    sem_post(&queue->mutex);
+
+    // Signal that an item is available
+    sem_post(&queue->items);
+
+    return 1;  // Successfully added command
+}
+
+int get_db_command(CommandQueue *queue, DatabaseCommand *cmd) {
+    if (sem_trywait(&queue->items) == -1) {
+        if (errno == EAGAIN) {
+            return 0;  // No items available
+        }
+        perror("Error waiting for items semaphore");
+        return -1;
+    }
+
+    sem_wait(&queue->mutex);  // Lock the queue
+
+    *cmd = queue->commands[queue->head];
+    queue->head = (queue->head + 1) % MAX_QUEUE_SIZE;
+    queue->count--;
+
+    sem_post(&queue->mutex);   // Unlock the queue
+    sem_post(&queue->spaces);  // Signal a space is available
+
+    return 1;  // Successfully got a command
+}
+
+void process_database_operations() {
+    DatabaseCommand cmd;
+
+    // Process all commands in the queue
+    while (get_db_command(&shared_mem->dbQueue, &cmd)) {
+        int result = -1;
+        int new_balance = 0;
+
+        // Process based on operation type
         if (cmd.operation == DEPOSIT) {
-            char buffer[256];
-            off_t position;
-            int found = find_client_in_db(cmd.entry.bankName, &position, buffer,
-                                          sizeof(buffer));
-
-            // Check if it's a new account request
-            if (strcmp(cmd.entry.bankName, "N") == 0) {
-                // Create a new account with a unique ID
-                sprintf(cmd.entry.bankName, "BankID_%d",
-                        get_available_bank_name());
-                printf("Creating new account with ID: %s\n",
-                       cmd.entry.bankName);
-
-                DatabaseEntry new_entry;
-                strcpy(new_entry.bankName, cmd.entry.bankName);
-                new_entry.id = cmd.entry.id;
-                new_entry.balance = cmd.entry.balance;
-
-                int res = add_to_db(&new_entry);
-                if (res != -1) {
-                    printf("DEBUG: SUCESS GIVEN IN ADD, %d\n", new_entry.id);
-
-                    cmd.result = new_entry.id;  // Success
-                } else {
-                    printf("DEBUG: FAILED GIVEN IN ADD, %d\n", new_entry.id);
-                    cmd.result = -1;  // Failed to add
-                }
-            } else if (found != -1) {
-                // Account exists, update the balance
-                DatabaseEntry existing_entry;
-                sscanf(buffer, "%s %d %d", existing_entry.bankName,
-                       &existing_entry.id, &existing_entry.balance);
-                existing_entry.balance += cmd.entry.balance;
-
-                int res = update_db(&existing_entry);
-                printf("DEBUG: SOMETHING IN UPDATE, %d\n",
-                       existing_entry.id);
-                cmd.result = (res == 0) ? existing_entry.id : -1;
-                shared_mem->request.amount =
-                    existing_entry
-                        .balance;  // Update the balance in the response
-            } else {
-                // Account doesn't exist and not a new account request
-                printf("DEBUG: DOESNT EXIST, %d\n", cmd.entry.id);
-                cmd.result = -1;
-            }
+            result = process_deposit(&cmd, &new_balance);
         } else if (cmd.operation == WITHDRAW) {
-            // For withdraw, check if the account exists and has sufficient
-            // balance
-            char buffer[256];
-            off_t position;
-            int found = find_client_in_db(cmd.entry.bankName, &position, buffer,
-                                          sizeof(buffer));
-
-            if (found == -1) {
-                // Account doesn't exist
-                printf("DEBUG: FOUND -1, %d\n", cmd.entry.id);
-                cmd.result = -1;
-            } else {
-                // Account exists, check balance
-                DatabaseEntry existing_entry;
-                sscanf(buffer, "%s %d %d", existing_entry.bankName,
-                       &existing_entry.id, &existing_entry.balance);
-
-                if (existing_entry.balance < cmd.entry.balance) {
-                    // Insufficient balance
-                    printf("DEBUG: INSUFFICIENT BALANCE, %d\n",
-                           existing_entry.id);
-                    cmd.result = -1;
-                } else {
-                    // Sufficient balance, update or remove
-                    existing_entry.balance -= cmd.entry.balance;
-                    shared_mem->request.amount =
-                        existing_entry
-                            .balance;  // Update the balance in the response
-
-                    if (existing_entry.balance == 0) {
-                        // Remove the account if balance is 0
-                        cmd.result =
-                            remove_from_db(existing_entry.bankName);
-                    } else {
-                        // Update the account
-                        printf("DEBUG: UPDATE WITHDRAW, %d\n", existing_entry.id);
-                        cmd.result = update_db(&existing_entry);
-                    }
-                }
-            }
+            result = process_withdraw(&cmd, &new_balance);
         }
 
-        // Mark the request as processed
-        shared_mem->processed = 1;
+        // Complete the transaction with the result
+        complete_transaction(cmd.transaction_id,
+                             result != -1 ? new_balance : -1);
+    }
+}
+
+int process_deposit(DatabaseCommand *cmd, int *new_balance) {
+    char buffer[256];
+    off_t position;
+    int found = find_client_in_db(cmd->entry.bankName, &position, buffer,
+                                  sizeof(buffer));
+
+    // Check if it's a new account request
+    if (strcmp(cmd->entry.bankName, "N") == 0) {
+        // Create a new account with a unique ID
+        sprintf(cmd->entry.bankName, "BankID_%02d",
+                get_available_bank_name());  // 1 as 01
+
+        DatabaseEntry new_entry;
+        strcpy(new_entry.bankName, cmd->entry.bankName);
+        new_entry.id = cmd->entry.id;
+        new_entry.balance = cmd->entry.balance;
+
+        int res = add_to_db(&new_entry);
+        if (res != -1) {
+            *new_balance = new_entry.balance;
+            return res;  // Success
+        }
+        return -1;  // Failed
+    } else if (found != -1) {
+        // Account exists, update the balance
+        DatabaseEntry existing_entry;
+        sscanf(buffer, "%s %d %d", existing_entry.bankName, &existing_entry.id,
+               &existing_entry.balance);
+        existing_entry.balance += cmd->entry.balance;
+
+        int res = update_db(&existing_entry);
+        if (res == 0) {
+            *new_balance = existing_entry.balance;
+            return existing_entry.id;  // Success
+        }
     }
 
-    sem_post(sem_server);
+    return -1;  // Failed
+}
 
-    // Signal the teller that the operation has been processed
-    sem_post(sem_teller);
+int process_withdraw(DatabaseCommand *cmd, int *new_balance) {
+    char buffer[256];
+    off_t position;
+    printf("DEBUG: Processing withdrawal for %s\n", cmd->entry.bankName);
+    int found = find_client_in_db(cmd->entry.bankName, &position, buffer,
+                                  sizeof(buffer));
+
+    if (found == -1) {
+        printf("Account not found\n");
+        return -1;  // Account not found
+    }
+
+    // Account exists, check balance
+    DatabaseEntry existing_entry;
+    sscanf(buffer, "%s %d %d", existing_entry.bankName, &existing_entry.id,
+           &existing_entry.balance);
+
+    if (existing_entry.balance < cmd->entry.balance) {
+        return -1;  // Insufficient balance
+    }
+
+    // Sufficient balance, update or remove
+    existing_entry.balance -= cmd->entry.balance;
+    *new_balance = existing_entry.balance;
+
+    if (existing_entry.balance == 0) {
+        // Remove the account if balance is 0
+        return remove_from_db(existing_entry.bankName) == 0 ? existing_entry.id
+                                                            : -1;
+    } else {
+        // Update the account
+        return update_db(&existing_entry) == 0 ? existing_entry.id : -1;
+    }
 }
 
 void setup_shared_memory() {
@@ -595,18 +615,35 @@ void setup_shared_memory() {
         perror("Error creating semaphores");
         exit(1);
     }
+
+    sem_init(&shared_mem->dbQueue.mutex, 1, 1);  // Mutex with initial value 1
+    sem_init(&shared_mem->dbQueue.items, 1,
+             0);  // Items semaphore with initial value 0
+    sem_init(&shared_mem->dbQueue.spaces, 1,
+             MAX_QUEUE_SIZE);  // Spaces semaphore with i
 }
 
 void cleanup_shared_memory() {
-    // Unlink and close semaphores
-    sem_unlink("/sem_server");
-    sem_unlink("/sem_teller");
+    // Destroy the transaction manager
+    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+        sem_destroy(&shared_mem->transactionManager.transactions[i].sem);
+    }
+    sem_destroy(&shared_mem->transactionManager.mutex);
+
+    // Destroy queue semaphores
+    sem_destroy(&shared_mem->dbQueue.mutex);
+    sem_destroy(&shared_mem->dbQueue.items);
+    sem_destroy(&shared_mem->dbQueue.spaces);
+
+    // Close and unlink other semaphores
     sem_close(sem_server);
     sem_close(sem_teller);
+    sem_unlink("/sem_server");
+    sem_unlink("/sem_teller");
 
-    // Unlink and unmap shared memory
-    shm_unlink(SHM_NAME);
+    // Unmap and unlink shared memory
     munmap(shared_mem, sizeof(SharedMemory));
+    shm_unlink(SHM_NAME);
 }
 
 // Signal handler for graceful shutdown
