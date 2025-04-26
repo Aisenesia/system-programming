@@ -16,6 +16,6 @@ client: src/client.c src/common.h
 
 clean:
 	ipcrm -a
-	rm -f ClientFIFO*
+	rm -f client_fifo*
 	rm -f ServerFIFO_Name
 	rm -f server teller client

@@ -43,6 +43,7 @@ typedef struct {
 
 typedef struct {
     OperationType operation;
+    int result; // Result of the operation
     DatabaseEntry entry; // Database entry for the operation
 } DatabaseCommand;
 
@@ -70,6 +71,7 @@ typedef struct {
 
 typedef struct {
     int success;
+    int bankID;
     int balance;
     char message[128];
 } ServerResponse;
@@ -78,7 +80,7 @@ typedef struct {
 typedef struct {
     ClientRequest request;
     int processed; // 0 = not processed, 1 = processed
-    int result;    // Result of the operation (e.g., success or failure)
+    int result [128];    // Result of the operation (e.g., success or failure)
     CommandQueue dbQueue; // Queue for database operations
 } SharedMemory;
 
