@@ -56,14 +56,12 @@ int main(int argc, char* argv[]) {
         }
         // Generate request from line
         ClientRequest request = generateRequestFromLine(0, line);
-        printf("Generated request from line %d: %s %s %d\n", line_number,
-               request.bankName,
-               request.operation == DEPOSIT ? "deposit" : "withdraw",
-               request.amount);
+        
         // Add request to requests array
         requests[line_number - 1] = request;
     }
     fclose(client_file);
+    printf("%d clients to connect.. creating clients..\n", line_number);
 
     // mkfifo
     //  Create the client FIFO
@@ -82,11 +80,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    close(client_fifo_fd);
+    
 
+    close(client_fifo_fd);
+    printf("Connected to Adabank..\n");
     for (int i = 0; i < line_number; i++) {
         requests[i].clientID = client_id + i;
+        printf("Client%02d connected..%s %d credits\n", requests[i].clientID,
+                requests[i].operation == DEPOSIT ? "depositing" : "withdrawing",
+                requests[i].amount);
     }
+    printf("..\n");
 
     // Open the server FIFO
     int server_fifo_fd = open(SERVER_FIFO, O_WRONLY);
@@ -112,7 +116,6 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < line_number; i++) {
         char client_fifo[64];
         sprintf(client_fifo, "%s_%d", CLIENT_FIFO, client_id + i);
-        printf("Waiting for server response on %s\n", client_fifo);
 
         while (access(client_fifo, F_OK) == -1);
 
@@ -130,14 +133,9 @@ int main(int argc, char* argv[]) {
         }
         close(client_fifo_fd);
         // Print the response
-        printf("Response from server: %s\n", response.message);
+        printf("%s\n", response.message);
     }
-    // Cleanup
-
-    // Close the server FIFO
-
-    // Open the client file
-
+    printf("exiting..\n");
     return 0;
 }
 
