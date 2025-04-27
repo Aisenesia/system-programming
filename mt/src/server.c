@@ -16,7 +16,6 @@
 
 #define DATABASE "logs/AdaBank.bankLog"
 
-
 #define DEBUG_MODE 0
 
 // Function prototypes
@@ -133,7 +132,6 @@ int main() {
     int tellers_tail = 0;
     int tellers_count = 0;
 
-
     // Main server loop
     while (1) {
         // First, process any pending database operations
@@ -209,8 +207,8 @@ int main() {
             tellers_tail = (tellers_tail + 1) % MAX_CLIENTS;
             tellers_count++;
 
-            printf("-- Teller PID%d is active serving Client%02d\n",
-                   teller_pid, request.clientID);
+            printf("-- Teller PID%d is active serving Client%02d\n", teller_pid,
+                   request.clientID);
             teller_id_giver++;
         }
         printf("...\n");
@@ -219,9 +217,10 @@ int main() {
 
         // Check again for database operations before next loop iteration
         process_database_operations();
-        
+
         // wait for tellers
-        for(int i = tellers_head; i != tellers_tail; i = (i + 1) % MAX_CLIENTS) {
+        for (int i = tellers_head; i != tellers_tail;
+             i = (i + 1) % MAX_CLIENTS) {
             int status;
             pid_t result = waitTeller(tellers[i], &status);
             if (result == -1) {
@@ -233,8 +232,6 @@ int main() {
                 tellers_count--;
             }
         }
-
-
 
         printf("...\n");
         printf("Waiting for clients @%s…\n", SERVER_FIFO);
@@ -266,11 +263,12 @@ int allocate_transaction() {
 
     // Find an available transaction slot
     for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
-        if (shared_mem->transactionManager.transactions[i].completed && shared_mem->transactionManager.transactions[i].result == 0) {
+        if (shared_mem->transactionManager.transactions[i].completed &&
+            shared_mem->transactionManager.transactions[i].result == 0) {
             shared_mem->transactionManager.transactions[i].completed = 0;
             shared_mem->transactionManager.transactions[i].result =
                 -2;  // Pending
-                // printf("DEBUG: Allocating transaction %d\n", i);
+            // printf("DEBUG: Allocating transaction %d\n", i);
             transaction_id = i;
             break;
         }
@@ -286,7 +284,8 @@ void complete_transaction(int transaction_id, int result) {
 
     sem_wait(&shared_mem->transactionManager.mutex);
 
-    //printf("DEBUG: Completing transaction %d with result %d\n", transaction_id, result);
+    // printf("DEBUG: Completing transaction %d with result %d\n",
+    // transaction_id, result);
 
     shared_mem->transactionManager.transactions[transaction_id].result = result;
     shared_mem->transactionManager.transactions[transaction_id].completed = 1;
@@ -743,7 +742,8 @@ void cleanup_and_exit() {
     struct tm *tm_info = localtime(&now);
     strftime(timestr, sizeof(timestr), "%H:%M %B %d %Y", tm_info);
 
-    // delete all the client_fifo_id up to the current teller id giver if they exist
+    // delete all the client_fifo_id up to the current teller id giver if they
+    // exist
     for (int i = 1; i < teller_id_giver; i++) {
         char client_fifo[64];
         snprintf(client_fifo, sizeof(client_fifo), "%s_%d", CLIENT_FIFO, i);
@@ -760,21 +760,9 @@ void cleanup_and_exit() {
 
     update_db_timestamp(timestr);
 
-    
-
     printf("Adabank says “Bye”…\n");
     exit(0);
 }
-/*
-DB Structure:
-# Adabank Log file updated @10:37 April 18 2025 // first line is timestamp, #
-are comments # BankID_01 D 300 W 300 0 // there has been a deposit of 300 and a
-withdraw of 300, resulting in a balance of 0 and causing the account to be
-removed, thus it is commented out BankID_02 D 2000 2000 // there has been a
-deposit of 200 and no withdraw, resulting in a balance of 2000 BankID_03 D 20 20
-// there has been a deposit of 20 and no withdraw, resulting in a balance of 20
-
-*/
 
 int find_client_in_db(const char *bankName, off_t *position, char *buffer,
                       size_t buffer_size) {
@@ -937,7 +925,7 @@ int add_to_db(DatabaseEntry req) {
     }
     close(db_fd);  // Close the database file
     delete_backup();
-    return 0;      // Return 0
+    return 0;  // Return 0
 }
 
 int update_db(DatabaseEntry entry, char OP, int amount) {
@@ -1183,7 +1171,7 @@ int remove_from_db(const char *bankName) {
     }
 
     delete_backup();  // Remove the backup file
-    return 0;  // Success
+    return 0;         // Success
 }
 
 int update_db_timestamp(const char *timestamp) {
@@ -1205,7 +1193,8 @@ int update_db_timestamp(const char *timestamp) {
 
     // Write the new timestamp as the first line
     char timestamp_line[256];
-    snprintf(timestamp_line, sizeof(timestamp_line), "# Adabank Log file updated @%s\n", timestamp);
+    snprintf(timestamp_line, sizeof(timestamp_line),
+             "# Adabank Log file updated @%s\n", timestamp);
     if (write(temp_fd, timestamp_line, strlen(timestamp_line)) == -1) {
         perror("Error writing timestamp to temporary file");
         close(db_fd);
@@ -1216,12 +1205,13 @@ int update_db_timestamp(const char *timestamp) {
     // Read the first line of the original file
     bytes_read = read(db_fd, buffer, sizeof(buffer) - 1);
     if (bytes_read > 0) {
-        buffer[bytes_read] = '\0'; // Null-terminate the buffer
+        buffer[bytes_read] = '\0';  // Null-terminate the buffer
         char *newline_pos = strchr(buffer, '\n');
         if (newline_pos != NULL) {
-            *newline_pos = '\0'; // Null-terminate the first line
+            *newline_pos = '\0';  // Null-terminate the first line
             if (buffer[0] != '#') {
-                // If the first line does not start with '#', write it to the temp file
+                // If the first line does not start with '#', write it to the
+                // temp file
                 if (write(temp_fd, buffer, strlen(buffer)) == -1 ||
                     write(temp_fd, "\n", 1) == -1) {
                     perror("Error writing to temporary file");
@@ -1261,7 +1251,7 @@ int update_db_timestamp(const char *timestamp) {
         return -1;
     }
 
-    return 0; // Success
+    return 0;  // Success
 }
 
 void take_backup() {
@@ -1304,7 +1294,7 @@ void delete_backup() {
     // Delete the backup file
     char backup_file[256];
     snprintf(backup_file, sizeof(backup_file), "%s.bak", DATABASE);
-    unlink(backup_file); // silently ignore if it doesn't exist
+    unlink(backup_file);  // silently ignore if it doesn't exist
 }
 
 int restore_backup() {
@@ -1324,5 +1314,5 @@ int restore_backup() {
         return -1;
     }
 
-    return 0; // Success
+    return 0;  // Success
 }
