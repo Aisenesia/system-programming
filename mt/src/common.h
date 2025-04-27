@@ -10,7 +10,7 @@
 #include <fcntl.h>
 
 #define MAX_CLIENTS 20
-#define SERVER_FIFO "ServerFIFO_Name"
+#define SERVER_FIFO "server_fifo" // FIFO name
 #define SHM_NAME "AdaBankSharedMemory"
 #define LOG_FILE "logs/AdaBank.bankLog"
 #define CLIENT_FIFO "client_fifo" 
@@ -25,6 +25,10 @@
 
 // Signal macros
 #define SHUTDOWN_SIGNAL SIGINT
+
+#define STATUS_EXISTING 0
+#define STATUS_NEW 11
+#define STATUS_DELETED 12
 
 
 pid_t Teller(void *func, void *arg);

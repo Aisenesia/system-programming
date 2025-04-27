@@ -18,13 +18,10 @@
 
 #define DEBUG_MODE 0
 
-#define TELLER_DEBUG_FILE "files/teller_debug.txt"
-FILE *teller_debug_file = NULL;
-
 // Function prototypes
 void handle_signal(int sig);
 void cleanup_and_exit();
-void teller_function(ClientRequest *request);  // Teller function
+pid_t teller_function(ClientRequest *request);  // Teller function
 void setup_shared_memory();
 void cleanup_shared_memory();
 
@@ -43,8 +40,8 @@ int update_db_timestamp(int fd);
 void process_database_operations();
 
 void setup_transaction_manager();
-int process_deposit(DatabaseCommand *cmd, int *new_balance);
-int process_withdraw(DatabaseCommand *cmd, int *new_balance);
+int process_deposit(DatabaseCommand *cmd, int *bankID, int *status);
+int process_withdraw(DatabaseCommand *cmd, int *bankID, int *status);
 int allocate_transaction();
 int wait_for_transaction(int transaction_id);
 
@@ -96,7 +93,6 @@ int main() {
     signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE signal
 
     // Open the debug file
-    teller_debug_file = fopen(TELLER_DEBUG_FILE, "a");
 
     printf("Adabank is active…\n");
 
@@ -186,6 +182,9 @@ int main() {
             continue;
         }
 
+        printf("- Received %d clients from %s\n", number_of_clients,
+               CLIENT_FIFO);  // me when i spread misinformation
+
         // Process each client request
         for (int i = 0; i < number_of_clients; i++) {
             ClientRequest request;
@@ -194,19 +193,18 @@ int main() {
                 break;
             }
 
-            printf("Received request from client %d: %s %s %d\n",
-                   request.clientID, request.bankName,
-                   request.operation == DEPOSIT ? "deposit" : "withdraw",
-                   request.amount);
-
+            printf("-- Teller PID%d is active serving Client%02d\n",
+                   teller_function(&request), request.clientID);
             teller_id_giver++;
-            teller_function(&request);
         }
+        printf("...\n");
 
         close(server_fifo_fd);
 
         // Check again for database operations before next loop iteration
         process_database_operations();
+        printf("...\n");
+        printf("Waiting for clients @%s…\n", SERVER_FIFO);
     }
 
     cleanup_and_exit();
@@ -235,10 +233,11 @@ int allocate_transaction() {
 
     // Find an available transaction slot
     for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
-        if (shared_mem->transactionManager.transactions[i].completed) {
+        if (shared_mem->transactionManager.transactions[i].completed && shared_mem->transactionManager.transactions[i].result == 0) {
             shared_mem->transactionManager.transactions[i].completed = 0;
             shared_mem->transactionManager.transactions[i].result =
                 -2;  // Pending
+                printf("DEBUG: Allocating transaction %d\n", i);
             transaction_id = i;
             break;
         }
@@ -253,6 +252,9 @@ void complete_transaction(int transaction_id, int result) {
     if (transaction_id < 0 || transaction_id >= MAX_QUEUE_SIZE) return;
 
     sem_wait(&shared_mem->transactionManager.mutex);
+
+    printf("DEBUG: Completing transaction %d with result %d\n",
+           transaction_id, result);
 
     shared_mem->transactionManager.transactions[transaction_id].result = result;
     shared_mem->transactionManager.transactions[transaction_id].completed = 1;
@@ -273,36 +275,39 @@ int wait_for_transaction(int transaction_id) {
     // Get the result
     int result =
         shared_mem->transactionManager.transactions[transaction_id].result;
+    shared_mem->transactionManager.transactions[transaction_id].result = 0;
 
     return result;
 }
 
 // teller main function
 
-void teller_function(ClientRequest *request) {
+pid_t teller_function(ClientRequest *request) {
     // Determine the operation type, call Teller(deposit/withdraw)
-    printf("Teller %d: Processing request for %s\n", request->clientID,
-           request->bankName);
+
     if (request->operation == DEPOSIT) {
         // Create a new process for deposit operation
         pid_t teller_pid = Teller(deposit, request);
         if (teller_pid == -1) {
             perror("Error creating deposit teller process");
-            return;
+            return -1;
         }
         // waitTeller(teller_pid, NULL);  // Wait for the teller process to
         // finish
+        return teller_pid;
     } else if (request->operation == WITHDRAW) {
         // Create a new process for withdraw operation
         pid_t teller_pid = Teller(withdraw, request);
         if (teller_pid == -1) {
             perror("Error creating withdraw teller process");
-            return;
+            return -1;
         }
         // waitTeller(teller_pid, NULL);  // Wait for the teller process to
         // finish
+        return teller_pid;
     } else {
-        fprintf(stderr, "Invalid operation type\n");
+        perror("Error: Invalid operation type\n");
+        return -1;  // Invalid operation
     }
 }
 
@@ -354,11 +359,15 @@ void *deposit(void *arg) {
     // Wait for the operation to complete
     int result = wait_for_transaction(transaction_id);
 
+    if (result == -2) {
+        printf("DEBUG: Transaction %d is still pending\n",
+               transaction_id);  // shouldnt happen afaik
+    }
+
     // Check if operation was successful
     if (result != -1) {
         // Success
         response.success = 1;
-        response.balance = result;  // Updated balance
         // from where to get the bankID?
         sprintf(response.message, "Client%02d served.. BankID_%02d",
                 request->clientID, result);
@@ -369,7 +378,7 @@ void *deposit(void *arg) {
                 request->clientID);
     }
 
-send_response:
+send_response:;
     // Send the response through the FIFO
     int teller_fd = open(teller_fifo, O_WRONLY);
     if (teller_fd != -1) {
@@ -416,10 +425,6 @@ void *withdraw(void *arg) {
     cmd.entry.id = request->clientID;
     cmd.entry.balance = request->amount;
 
-    // Add debug log to track semaphore and queue state
-
-    // Add the command to the queue
-
     if (!add_db_command(&shared_mem->dbQueue, &cmd)) {
         strcpy(response.message, "Database operation queue is full");
         // Fix the sem_getvalue call by providing a valid pointer to an integer
@@ -432,14 +437,13 @@ void *withdraw(void *arg) {
 
     // Wait for the operation to complete
     int result = wait_for_transaction(transaction_id);
-    printf("DEBUG: Transaction %d completed with result %d\n", transaction_id,
-           result);
+
     // Check if operation was successful
     if (result != -1) {
         // Success
         response.success = 1;
         response.balance = result;  // Updated balance
-        sprintf(response.message, "Client%02d served.. BankID_%d",
+        sprintf(response.message, "Client%02d served.. BankID_%02d",
                 request->clientID, result);
     } else {
         // Failed
@@ -448,7 +452,7 @@ void *withdraw(void *arg) {
                 request->clientID);
     }
 
-send_response:
+send_response:;  // empty statement, C sucks
     // Send the response through the FIFO
     int teller_fd = open(teller_fifo, O_WRONLY);
     if (teller_fd != -1) {
@@ -518,23 +522,41 @@ void process_database_operations() {
     while (get_db_command(&shared_mem->dbQueue, &cmd)) {
         int result = -1;
         int bankID = 0;
+        int status = -1;  // to check if the account is removed or not etc
 
         // Process based on operation type
         if (cmd.operation == DEPOSIT) {
-            result = process_deposit(&cmd, &bankID);
+            result = process_deposit(&cmd, &bankID, &status);
         } else if (cmd.operation == WITHDRAW) {
-            result = process_withdraw(&cmd, &bankID);
+            result = process_withdraw(&cmd, &bankID, &status);
         }
 
+        char buffer[256];
+        sprintf(buffer, "Client%02d %s %d credits…", cmd.entry.id,
+                cmd.operation == DEPOSIT ? "deposits" : "withdraws",
+                cmd.entry.balance);
+        printf("%s", buffer);
+        if (result == -1) {
+            printf("operation not permitted.");
+        } else {
+            printf("updating log...");
+        }
+
+        if (status == STATUS_DELETED) {
+            printf("Bye Client%02d", cmd.entry.id);
+        }
+
+        printf("\n");  // here if the operation caused the account to be
+                       // removed, printt Bye Client01
+
         // Complete the transaction with the result
-        printf("DEBUG: ProcDB ts: %d with result %d\n", cmd.transaction_id,
-               result);
+
         result = result == -1 ? -1 : bankID;
         complete_transaction(cmd.transaction_id, result);
     }
 }
 
-int process_deposit(DatabaseCommand *cmd, int *bankID) {
+int process_deposit(DatabaseCommand *cmd, int *bankID, int *status) {
     char buffer[256];
     off_t position;
     int found = find_client_in_db(cmd->entry.bankName, &position, buffer,
@@ -542,6 +564,7 @@ int process_deposit(DatabaseCommand *cmd, int *bankID) {
 
     // Check if it's a new account request
     if (strcmp(cmd->entry.bankName, "N") == 0) {
+        *status = STATUS_NEW;
         // Create a new account with a unique ID
         *bankID = get_available_bank_name();
         sprintf(cmd->entry.bankName, "BankID_%02d",
@@ -558,6 +581,7 @@ int process_deposit(DatabaseCommand *cmd, int *bankID) {
         }
         return -1;  // Failed
     } else if (found != -1) {
+        *status = STATUS_EXISTING;
         // Account exists, update the balance
         DatabaseEntry existing_entry;
         sscanf(buffer, "%s %d %d", existing_entry.bankName, &existing_entry.id,
@@ -574,19 +598,12 @@ int process_deposit(DatabaseCommand *cmd, int *bankID) {
     return -1;  // Failed
 }
 
-int process_withdraw(DatabaseCommand *cmd, int *bankID) {
-    char buffer[256];
-    off_t position;
-    printf("DEBUG: Processing withdrawal for %s\n", cmd->entry.bankName);
-
+int process_withdraw(DatabaseCommand *cmd, int *bankID, int *status) {
     DatabaseEntry existing_entry = get_client_from_db(cmd->entry.bankName);
     int found = existing_entry.id;
 
     if (found == -1) {
-        printf("Account not found\n");
         return -1;  // Account not found
-    } else {
-        printf("DEBUG: Found client, bankname: %s\n", existing_entry.bankName);
     }
 
     // Account exists, check balance
@@ -598,18 +615,16 @@ int process_withdraw(DatabaseCommand *cmd, int *bankID) {
     // Sufficient balance, update or remove
     existing_entry.balance -= cmd->entry.balance;
     sscanf(existing_entry.bankName, "BankID_%d", bankID);
-    printf("DEBUG: WITHDRAW - EE: %s\n", existing_entry.bankName);
-    printf("DEBUG: WITHDRAW - BankID: %d\n", *bankID);
 
     if (existing_entry.balance == 0) {
         // Remove the account if balance is 0
+        *status = STATUS_DELETED;
         char bankName[32];
         strcpy(bankName, existing_entry.bankName);
         return remove_from_db(bankName);
     } else {
         // Update the account
-        printf("DEBUG: WITHDRAW - Updating balance with -%d\n",
-               cmd->entry.balance);
+        *status = STATUS_EXISTING;
         return update_db(existing_entry, 'W', cmd->entry.balance);
     }
 }
@@ -795,8 +810,6 @@ DatabaseEntry get_client_from_db(const char *bankName) {
     }
 
     // Print the results
-    printf("DEBUG: BankName: %s\n", entry.bankName);
-    printf("DEBUG: Balance: %d\n", entry.balance);
     close(fd);
     return entry;
 }
@@ -813,7 +826,8 @@ int get_available_bank_name() {
     ssize_t bytes_read;
     size_t leftover = 0;
 
-    while ((bytes_read = read(db_fd, buffer + leftover, sizeof(buffer) - leftover - 1)) > 0) {
+    while ((bytes_read = read(db_fd, buffer + leftover,
+                              sizeof(buffer) - leftover - 1)) > 0) {
         buffer[bytes_read + leftover] = '\0';  // Null-terminate the buffer
         char *line_start = buffer;
         char *newline_pos;
@@ -821,17 +835,15 @@ int get_available_bank_name() {
         while ((newline_pos = strchr(line_start, '\n')) != NULL) {
             *newline_pos = '\0';  // Null-terminate the current line
 
-            // Parse the line to extract the bank name
-            char bank_name[32];
-            // line format: "bankName D int1 int2 int3... W int1 int2 int3... balance",
-            int current_id;
-            sscanf(line_start, "BankID_%d", &current_id);
-            if (current_id > last_bank_id) {
-                last_bank_id = current_id;  // Update the last bank ID
+            // Skip comment lines (lines starting with #)
+            if (line_start[0] != '#') {
+                int current_id = 0;
+                if (sscanf(line_start, "BankID_%d", &current_id) == 1) {
+                    if (current_id > last_bank_id) {
+                        last_bank_id = current_id;  // Update the last bank ID
+                    }
+                }
             }
-               
-                
-            
 
             line_start = newline_pos + 1;  // Move to the next line
         }
@@ -884,7 +896,21 @@ int update_db(DatabaseEntry entry, char OP, int amount) {
         return -1;  // Entry not found
     }
 
-    printf("DEBUG: buffer : %s\n", buffer);
+    int d_pos = -1;
+    int w_pos = -1;
+    int comment_pos = -1;
+
+    for (int i = 0; i < sizeof(buffer); i++) {
+        if (buffer[i] == '#') {
+            comment_pos = i;
+            buffer[i] = '\0';
+            break;
+        } else if (buffer[i] == 'D') {
+            d_pos = i;
+        } else if (buffer[i] == 'W') {
+            w_pos = i;
+        }
+    }
 
     // Parse the existing entry
     char working_buffer[256];
@@ -908,7 +934,6 @@ int update_db(DatabaseEntry entry, char OP, int amount) {
     // Extract the balance
     int balance_pos = 0;
     int balance = get_balance(buffer, &balance_pos);
-    printf("DEBUG: balance : %d\n", balance);
 
     // Update the balance
     if (OP == 'D') {
@@ -926,22 +951,58 @@ int update_db(DatabaseEntry entry, char OP, int amount) {
     int pos = 0;
 
     // Start with the bank ID
-    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, "%s", tokens[0]);
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, "%s",
+                    tokens[0]);
 
     // Copy all the middle tokens (transaction history)
     for (int i = 1; i < token_count - 1; i++) {
-        pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %s", tokens[i]);
+        pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %s",
+                        tokens[i]);
+    }
+
+    char comment[256];
+    if (comment_pos != -1) {
+        // Copy the comment part
+        comment[0] = '#';
+        strcpy(comment + 1, buffer + comment_pos + 1);
+        comment[sizeof(comment) - 1] = '\0';
+    } else {
+        comment[0] = '\0';  // No comment
     }
 
     // Add new transaction
-    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %c %d", OP, amount);
-
+    int c_pos = OP == 'D' ? d_pos : w_pos;
+    if (c_pos == -1) {
+        pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos,
+                        " %c %d", OP, amount);
+    } else {
+        // if operation is deposit add it just before the w_pos
+        if (OP == 'D') {
+            char rest[256];
+            strncpy(rest, updated_entry + w_pos, sizeof(updated_entry) - w_pos);
+            pos +=
+                snprintf(updated_entry + w_pos, sizeof(updated_entry) - w_pos,
+                         "%d %s", amount, rest);
+            pos = strlen(updated_entry);
+        } else {
+            // if operation is withdraw we can add it after the pos.
+            pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos,
+                            " %c %d", OP, amount);
+        }
+    }
     // Add updated balance
-    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %d\n", balance);
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %d",
+                    balance);
+
+    // Add the comment if it exists
+    if (comment_pos != -1) {
+        pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %s",
+                        comment);
+    }
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, "\n");
 
     // Ensure null-termination
     updated_entry[sizeof(updated_entry) - 1] = '\0';
-    printf("DEBUG: updated_entry : %s\n", updated_entry);
 
     // Rewrite the entire file
     FILE *db_file = fopen(DATABASE, "r");
