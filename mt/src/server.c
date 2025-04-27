@@ -35,7 +35,7 @@ int find_client_in_db(const char *bankName, off_t *position, char *buffer,
 int get_available_bank_name();
 DatabaseEntry get_client_from_db(const char *bankName);
 int get_balance(const char *line, int *pos);
-int update_db_timestamp(int fd);
+int update_db_timestamp(const char *timetamp);
 
 void process_database_operations();
 
@@ -122,6 +122,12 @@ int main() {
         cleanup_and_exit();
     }
 
+    pid_t tellers[MAX_CLIENTS];
+    int tellers_head = 0;
+    int tellers_tail = 0;
+    int tellers_count = 0;
+
+
     // Main server loop
     while (1) {
         // First, process any pending database operations
@@ -192,9 +198,13 @@ int main() {
                 perror("Error reading from server FIFO");
                 break;
             }
+            pid_t teller_pid = teller_function(&request);
+            tellers[tellers_tail] = teller_pid;
+            tellers_tail = (tellers_tail + 1) % MAX_CLIENTS;
+            tellers_count++;
 
             printf("-- Teller PID%d is active serving Client%02d\n",
-                   teller_function(&request), request.clientID);
+                   teller_pid, request.clientID);
             teller_id_giver++;
         }
         printf("...\n");
@@ -203,6 +213,23 @@ int main() {
 
         // Check again for database operations before next loop iteration
         process_database_operations();
+        
+        // wait for tellers
+        for(int i = tellers_head; i != tellers_tail; i = (i + 1) % MAX_CLIENTS) {
+            int status;
+            pid_t result = waitpid(tellers[i], &status, WNOHANG);
+            if (result == -1) {
+                perror("Error waiting for teller process");
+            } else if (result > 0) {
+                // Teller process has finished
+                printf("Teller PID%d finished\n", result);
+                tellers_head = (tellers_head + 1) % MAX_CLIENTS;
+                tellers_count--;
+            }
+        }
+
+
+
         printf("...\n");
         printf("Waiting for clients @%s…\n", SERVER_FIFO);
     }
@@ -1121,4 +1148,14 @@ int remove_from_db(const char *bankName) {
     }
 
     return 0;  // Success
+}
+
+
+int update_db_timestamp(const char *timetamp) {
+    int db_fd = open(DATABASE, O_WRONLY | O_APPEND);
+    if (db_fd == -1) {
+        perror("Error opening database");
+        return -1;
+    }
+    // write to first line, commented
 }

@@ -26,5 +26,5 @@ pid_t Teller(void *func, void *arg) {
 }
 
 int waitTeller(pid_t pid, int* status){
-    return waitpid(pid, status, 0); // Wait for the specific child process
+    return waitpid(pid, status, WNOHANG); // Wait for the specific child process
 }
