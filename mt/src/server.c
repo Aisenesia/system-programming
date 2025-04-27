@@ -412,7 +412,7 @@ void *deposit(void *arg) {
 
 send_response:;
     // Send the response through the FIFO
-    int teller_fd = open(teller_fifo, O_WRONLY | O_NONBLOCK);
+    int teller_fd = open(teller_fifo, O_WRONLY);
     if (teller_fd != -1) {
         write(teller_fd, &response, sizeof(response));
         close(teller_fd);
@@ -1175,82 +1175,96 @@ int remove_from_db(const char *bankName) {
 }
 
 int update_db_timestamp(const char *timestamp) {
-    int db_fd = open(DATABASE, O_RDONLY);
+    int db_fd = open(DATABASE, O_RDWR);
     if (db_fd == -1) {
         perror("Error opening database");
-        return -1;
-    }
-
-    int temp_fd = open("temp.db", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (temp_fd == -1) {
-        perror("Error creating temporary file");
-        close(db_fd);
         return -1;
     }
 
     char buffer[256];
     ssize_t bytes_read;
 
-    // Write the new timestamp as the first line
+    // Prepare the new timestamp line
     char timestamp_line[256];
     snprintf(timestamp_line, sizeof(timestamp_line),
              "# Adabank Log file updated @%s\n", timestamp);
-    if (write(temp_fd, timestamp_line, strlen(timestamp_line)) == -1) {
-        perror("Error writing timestamp to temporary file");
-        close(db_fd);
-        close(temp_fd);
-        return -1;
-    }
 
-    // Read the first line of the original file
+    // Read the first line of the file
     bytes_read = read(db_fd, buffer, sizeof(buffer) - 1);
     if (bytes_read > 0) {
         buffer[bytes_read] = '\0';  // Null-terminate the buffer
         char *newline_pos = strchr(buffer, '\n');
         if (newline_pos != NULL) {
             *newline_pos = '\0';  // Null-terminate the first line
-            if (buffer[0] != '#') {
-                // If the first line does not start with '#', write it to the
-                // temp file
-                if (write(temp_fd, buffer, strlen(buffer)) == -1 ||
-                    write(temp_fd, "\n", 1) == -1) {
-                    perror("Error writing to temporary file");
+
+            if (strncmp(buffer, "# Adabank", 9) == 0) {
+                // If the first line starts with "# Adabank", overwrite it
+                lseek(db_fd, 0, SEEK_SET);  // Move to the beginning of the file
+                if (write(db_fd, timestamp_line, strlen(timestamp_line)) == -1) {
+                    perror("Error overwriting timestamp in database");
+                    close(db_fd);
+                    return -1;
+                }
+            } else {
+                // If the first line does not start with "# Adabank", shift content
+                int temp_fd = open("temp.db", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (temp_fd == -1) {
+                    perror("Error creating temporary file");
+                    close(db_fd);
+                    return -1;
+                }
+
+                // Write the new timestamp as the first line
+                if (write(temp_fd, timestamp_line, strlen(timestamp_line)) == -1) {
+                    perror("Error writing timestamp to temporary file");
                     close(db_fd);
                     close(temp_fd);
                     return -1;
                 }
-            }
-            // Move the file descriptor to the start of the next line
-            lseek(db_fd, newline_pos - buffer + 1, SEEK_SET);
-        }
-    }
 
-    // Copy the rest of the original file to the temporary file
-    while ((bytes_read = read(db_fd, buffer, sizeof(buffer))) > 0) {
-        if (write(temp_fd, buffer, bytes_read) == -1) {
-            perror("Error writing to temporary file");
+                // Write the rest of the original file to the temporary file
+                lseek(db_fd, 0, SEEK_SET);  // Reset to the beginning of the file
+                while ((bytes_read = read(db_fd, buffer, sizeof(buffer))) > 0) {
+                    if (write(temp_fd, buffer, bytes_read) == -1) {
+                        perror("Error writing to temporary file");
+                        close(db_fd);
+                        close(temp_fd);
+                        return -1;
+                    }
+                }
+
+                if (bytes_read == -1) {
+                    perror("Error reading from database");
+                    close(db_fd);
+                    close(temp_fd);
+                    return -1;
+                }
+
+                close(db_fd);
+                close(temp_fd);
+
+                // Replace the original file with the updated file
+                if (rename("temp.db", DATABASE) == -1) {
+                    perror("Error replacing database file");
+                    return -1;
+                }
+                return 0;  // Success
+            }
+        }
+    } else if (bytes_read == 0) {
+        // If the file is empty, just write the timestamp
+        if (write(db_fd, timestamp_line, strlen(timestamp_line)) == -1) {
+            perror("Error writing timestamp to empty database");
             close(db_fd);
-            close(temp_fd);
             return -1;
         }
-    }
-
-    if (bytes_read == -1) {
-        perror("Error reading from database");
+    } else {
+        perror("Error reading database");
         close(db_fd);
-        close(temp_fd);
         return -1;
     }
 
     close(db_fd);
-    close(temp_fd);
-
-    // Replace the original file with the updated file
-    if (rename("temp.db", DATABASE) == -1) {
-        perror("Error replacing database file");
-        return -1;
-    }
-
     return 0;  // Success
 }
 
