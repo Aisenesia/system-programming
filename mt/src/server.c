@@ -1,13 +1,15 @@
+#include <ctype.h>  // isdigit
 #include <fcntl.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/select.h>
+#include <string.h>    //
+#include <sys/mman.h>  // shared memory
+#include <sys/select.h>  // select, fd_set, in main loop to do non-blocking server op
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>  // log timestamps
 #include <unistd.h>
 
 #include "common.h"  // Include the Teller library
@@ -26,14 +28,19 @@ void teller_function(ClientRequest *request);  // Teller function
 void setup_shared_memory();
 void cleanup_shared_memory();
 
-int find_client_in_db(const char *bankName, off_t *position, char *buffer,
-                      size_t buffer_size);
-DatabaseEntry *get_client_from_db(const char *bankName);
-int add_to_db(DatabaseEntry *req);
-int update_db(DatabaseEntry *req);
+// Database operations
+
+int add_to_db(DatabaseEntry entry);
+int update_db(DatabaseEntry entry, char OP, int amount);
 int remove_from_db(const char *bankName);
-void process_database_operations();
+int find_client_in_db(const char *bankName, off_t *position, char *buffer,
+                      size_t bufSize);
 int get_available_bank_name();
+DatabaseEntry get_client_from_db(const char *bankName);
+int get_balance(const char *line, int *pos);
+int update_db_timestamp(int fd);
+
+void process_database_operations();
 
 void setup_transaction_manager();
 int process_deposit(DatabaseCommand *cmd, int *new_balance);
@@ -60,19 +67,24 @@ sem_t *sem_db_dependency = NULL;
 int main() {
     // Debuggind Database operations.
     if (DEBUG_MODE) {
-        DatabaseEntry *entry;
+        off_t position;
+        char buffer[256];
 
-        entry = get_client_from_db("BankID_02");
-
-        if (entry != NULL) {
-            printf("BankID_02 found: %s %d %d\n", entry->bankName, entry->id,
-                   entry->balance);
-            free(entry);
+        int res =
+            find_client_in_db("BankID_02", &position, buffer, sizeof(buffer));
+        if (res == 0) {
+            printf("Found client: %s\n", buffer);
         } else {
-            printf("BankID_02 not found\n");
+            printf("Client not found\n");
         }
 
-        // remove_from_db("BankID_01");
+        DatabaseEntry entry = get_client_from_db("BankID_02");
+        if (entry.id != -1) {
+            printf("Client found: %s, Balance: %d\n", entry.bankName,
+                   entry.balance);
+        } else {
+            printf("Client not found\n");
+        }
 
         return 0;
     }
@@ -328,7 +340,6 @@ void *deposit(void *arg) {
     cmd.entry.id = request->clientID;
     cmd.entry.balance = request->amount;
 
-
     // Add the command to the queue
     if (!add_db_command(&shared_mem->dbQueue, &cmd)) {
         strcpy(response.message, "Database operation queue is full");
@@ -349,8 +360,8 @@ void *deposit(void *arg) {
         response.success = 1;
         response.balance = result;  // Updated balance
         // from where to get the bankID?
-        sprintf(response.message, "Client%02d served.. BankID_%02d", request->clientID,
-                result);
+        sprintf(response.message, "Client%02d served.. BankID_%02d",
+                request->clientID, result);
     } else {
         // Failed
         response.success = 0;
@@ -421,15 +432,15 @@ void *withdraw(void *arg) {
 
     // Wait for the operation to complete
     int result = wait_for_transaction(transaction_id);
-    printf("DEBUG: Transaction %d completed with result %d\n",
-           transaction_id, result);
+    printf("DEBUG: Transaction %d completed with result %d\n", transaction_id,
+           result);
     // Check if operation was successful
     if (result != -1) {
         // Success
         response.success = 1;
         response.balance = result;  // Updated balance
-        sprintf(response.message, "Client%02d served.. BankID_%d", request->clientID,
-                result);
+        sprintf(response.message, "Client%02d served.. BankID_%d",
+                request->clientID, result);
     } else {
         // Failed
         response.success = 0;
@@ -516,9 +527,9 @@ void process_database_operations() {
         }
 
         // Complete the transaction with the result
-        printf("DEBUG: ProcDB ts: %d with result %d\n",
-               cmd.transaction_id, result);
-               result = result == -1 ? -1 : bankID;
+        printf("DEBUG: ProcDB ts: %d with result %d\n", cmd.transaction_id,
+               result);
+        result = result == -1 ? -1 : bankID;
         complete_transaction(cmd.transaction_id, result);
     }
 }
@@ -541,7 +552,7 @@ int process_deposit(DatabaseCommand *cmd, int *bankID) {
         new_entry.id = cmd->entry.id;
         new_entry.balance = cmd->entry.balance;
 
-        int res = add_to_db(&new_entry);
+        int res = add_to_db(new_entry);
         if (res != -1) {
             return res;  // Success
         }
@@ -553,7 +564,7 @@ int process_deposit(DatabaseCommand *cmd, int *bankID) {
                &existing_entry.balance);
         existing_entry.balance += cmd->entry.balance;
 
-        int res = update_db(&existing_entry);
+        int res = update_db(existing_entry, 'D', cmd->entry.balance);
         if (res != -1) {
             sscanf(existing_entry.bankName, "BankID_%d", bankID);
             return existing_entry.id;  // Success
@@ -567,20 +578,18 @@ int process_withdraw(DatabaseCommand *cmd, int *bankID) {
     char buffer[256];
     off_t position;
     printf("DEBUG: Processing withdrawal for %s\n", cmd->entry.bankName);
-    int found = find_client_in_db(cmd->entry.bankName, &position, buffer,
-                                  sizeof(buffer));
 
-    printf("DEBUG: Found client at position %d, bankname: %s\n", found,
-           cmd->entry.bankName);
+    DatabaseEntry existing_entry = get_client_from_db(cmd->entry.bankName);
+    int found = existing_entry.id;
+
     if (found == -1) {
         printf("Account not found\n");
         return -1;  // Account not found
+    } else {
+        printf("DEBUG: Found client, bankname: %s\n", existing_entry.bankName);
     }
 
     // Account exists, check balance
-    DatabaseEntry existing_entry;
-    sscanf(buffer, "%s %d %d", existing_entry.bankName, &existing_entry.id,
-           &existing_entry.balance);
 
     if (existing_entry.balance < cmd->entry.balance) {
         return -1;  // Insufficient balance
@@ -594,10 +603,14 @@ int process_withdraw(DatabaseCommand *cmd, int *bankID) {
 
     if (existing_entry.balance == 0) {
         // Remove the account if balance is 0
-        return remove_from_db(existing_entry.bankName);
+        char bankName[32];
+        strcpy(bankName, existing_entry.bankName);
+        return remove_from_db(bankName);
     } else {
         // Update the account
-        return update_db(&existing_entry);
+        printf("DEBUG: WITHDRAW - Updating balance with -%d\n",
+               cmd->entry.balance);
+        return update_db(existing_entry, 'W', cmd->entry.balance);
     }
 }
 
@@ -679,8 +692,17 @@ void cleanup_and_exit() {
     printf("Adabank says “Bye”…\n");
     exit(0);
 }
+/*
+DB Structure:
+# Adabank Log file updated @10:37 April 18 2025 // first line is timestamp, #
+are comments # BankID_01 D 300 W 300 0 // there has been a deposit of 300 and a
+withdraw of 300, resulting in a balance of 0 and causing the account to be
+removed, thus it is commented out BankID_02 D 2000 2000 // there has been a
+deposit of 200 and no withdraw, resulting in a balance of 2000 BankID_03 D 20 20
+// there has been a deposit of 20 and no withdraw, resulting in a balance of 20
 
-// Helper function to find a client in the database and return its position
+*/
+
 int find_client_in_db(const char *bankName, off_t *position, char *buffer,
                       size_t buffer_size) {
     if (bankName == NULL || position == NULL || buffer == NULL) {
@@ -694,7 +716,7 @@ int find_client_in_db(const char *bankName, off_t *position, char *buffer,
         return -1;
     }
 
-    off_t offset = 0;
+    off_t offset = 0;  // Tracks the total offset in the file
     ssize_t bytes_read;
     size_t leftover = 0;
 
@@ -707,8 +729,10 @@ int find_client_in_db(const char *bankName, off_t *position, char *buffer,
         while ((newline_pos = strchr(line_start, '\n')) != NULL) {
             *newline_pos = '\0';  // Null-terminate the current line
 
-            // Check if the line contains the bankName
-            if (strstr(line_start, bankName) != NULL) {
+            // Skip comment lines (lines starting with #)
+            if (line_start[0] != '#' &&
+                strstr(line_start, bankName) == line_start) {
+                // We found the bank ID at the start of a non-comment line
                 *position = offset + (line_start - buffer);  // Set the position
                 close(db_fd);
                 strncpy(buffer, line_start,
@@ -723,7 +747,7 @@ int find_client_in_db(const char *bankName, off_t *position, char *buffer,
         // Handle leftover data (partial line at the end of the buffer)
         leftover = strlen(line_start);
         memmove(buffer, line_start, leftover);
-        offset += bytes_read;
+        offset += bytes_read - leftover;  // Update offset to exclude leftover
     }
 
     if (bytes_read == -1) {
@@ -733,204 +757,307 @@ int find_client_in_db(const char *bankName, off_t *position, char *buffer,
     close(db_fd);
     return -1;  // Client not found
 }
-
-DatabaseEntry *get_client_from_db(const char *bankName) {
+DatabaseEntry get_client_from_db(const char *bankName) {
     char buffer[256];
     off_t position;
+    DatabaseEntry entry;
     int fd = find_client_in_db(bankName, &position, buffer, sizeof(buffer));
     if (fd == -1) {
-        return NULL;  // Client not found
+        entry.id = -1;
+        return entry;  // Client not found
     }
 
-    DatabaseEntry *entry = malloc(sizeof(DatabaseEntry));
-    sscanf(buffer, "%s %d %d", entry->bankName, &entry->id, &entry->balance);
+    // line format: "bankName D int1 int2 int3... W int1 int2 int3... balance",
+    // indeterminate amount of ints Parse the entry
+
+    sscanf(buffer, "%s", entry.bankName);
+
+    // Find the last digit in the string by traversing backward
+    int len = strlen(buffer);
+    int i = len - 1;
+
+    // Skip non-digit characters from the end
+    while (i >= 0 && !isdigit(buffer[i])) {
+        i--;
+    }
+
+    // Find the start of the last number
+    int end = i;
+    while (i >= 0 && isdigit(buffer[i])) {
+        i--;
+    }
+
+    // Extract the last number (balance)
+    if (end >= 0) {
+        sscanf(&buffer[i + 1], "%d", &entry.balance);
+    } else {
+        entry.balance = 0;  // Default if no number is found
+    }
+
+    // Print the results
+    printf("DEBUG: BankName: %s\n", entry.bankName);
+    printf("DEBUG: Balance: %d\n", entry.balance);
     close(fd);
     return entry;
 }
 
 int get_available_bank_name() {
-    FILE *db_file = fopen(DATABASE, "r");
-    if (db_file == NULL) {
+    int db_fd = open(DATABASE, O_RDONLY);
+    if (db_fd == -1) {
         perror("Error opening database");
-        return 1;  // Default to 1 if file can't be opened
+        return 1;  // Default to 1 if the file can't be opened
     }
 
     int last_bank_id = 0;
-    char line[256];
-    char bank_name[32];
-    int id, balance;
+    char buffer[256];
+    ssize_t bytes_read;
+    size_t leftover = 0;
 
-    // Read line by line
-    while (fgets(line, sizeof(line), db_file) != NULL) {
-        if (sscanf(line, "%s %d %d", bank_name, &id, &balance) == 3) {
-            if (strncmp(bank_name, "BankID_", 7) == 0) {
-                int bank_id = atoi(&bank_name[7]);
-                if (bank_id > last_bank_id) {
-                    last_bank_id = bank_id;
-                }
+    while ((bytes_read = read(db_fd, buffer + leftover, sizeof(buffer) - leftover - 1)) > 0) {
+        buffer[bytes_read + leftover] = '\0';  // Null-terminate the buffer
+        char *line_start = buffer;
+        char *newline_pos;
+
+        while ((newline_pos = strchr(line_start, '\n')) != NULL) {
+            *newline_pos = '\0';  // Null-terminate the current line
+
+            // Parse the line to extract the bank name
+            char bank_name[32];
+            // line format: "bankName D int1 int2 int3... W int1 int2 int3... balance",
+            int current_id;
+            sscanf(line_start, "BankID_%d", &current_id);
+            if (current_id > last_bank_id) {
+                last_bank_id = current_id;  // Update the last bank ID
             }
+               
+                
+            
+
+            line_start = newline_pos + 1;  // Move to the next line
         }
+
+        // Handle leftover data (partial line at the end of the buffer)
+        leftover = strlen(line_start);
+        memmove(buffer, line_start, leftover);
     }
 
-    fclose(db_file);
+    if (bytes_read == -1) {
+        perror("Error reading database");
+    }
+
+    close(db_fd);
     return last_bank_id + 1;  // Return the next available bank ID
 }
-int add_to_db(DatabaseEntry *req) {
-    FILE *db_file = fopen(DATABASE, "a");
-    if (db_file == NULL) {
-        perror("Error opening database for appending");
+int add_to_db(DatabaseEntry req) {
+    int db_fd = open(DATABASE, O_WRONLY | O_APPEND);
+    if (db_fd == -1) {
+        perror("Error opening database");
         return -1;
     }
-
-    // Write the entry in the format "bankName id balance"
-    int result =
-        fprintf(db_file, "%s %d %d\n", req->bankName, req->id, req->balance);
-    fclose(db_file);
-
-    if (result < 0) {
+    // Write the entry in the format "bankName D balance"
+    char line[256];
+    sprintf(line, "%s D %d %d\n", req.bankName, req.balance,
+            req.balance);  // since its add, it can only have a deposit
+    ssize_t result = write(db_fd, line, strlen(line));
+    if (result == -1) {
         perror("Error writing to database");
+        close(db_fd);
         return -1;
     }
-
-    int ret;
-    sscanf(req->bankName, "%*s_%d",
-           &ret);  // Parse the entry back to get the ID
-    printf("DEBUG: Added to db returnID %d\n", ret);
-    return ret;  // Return ID on success
+    close(db_fd);  // Close the database file
+    return 0;      // Return 0
 }
 
-int update_db(DatabaseEntry *updated_client) {
-    // Open a temporary file for writing
-    char temp_file[256];
-    sprintf(temp_file, "%s.tmp", DATABASE);
-    FILE *temp = fopen(temp_file, "w");
-    if (temp == NULL) {
-        perror("Error creating temporary file");
+int update_db(DatabaseEntry entry, char OP, int amount) {
+    if (OP != 'D' && OP != 'W') {
+        fprintf(stderr, "Error: Invalid operation '%c'\n", OP);
         return -1;
     }
 
-    // Open the original database file for reading
+    char *bankName = entry.bankName;
+    char buffer[256];
+    off_t position;
+    int found = find_client_in_db(bankName, &position, buffer, sizeof(buffer));
+
+    if (found == -1) {
+        fprintf(stderr, "Error: Entry not found for %s\n", bankName);
+        return -1;  // Entry not found
+    }
+
+    printf("DEBUG: buffer : %s\n", buffer);
+
+    // Parse the existing entry
+    char working_buffer[256];
+    strncpy(working_buffer, buffer, sizeof(working_buffer) - 1);
+    working_buffer[sizeof(working_buffer) - 1] = '\0';
+
+    char *tokens[64];  // Array to hold pointers to tokens
+    int token_count = 0;
+    char *token = strtok(working_buffer, " \t\n");
+
+    while (token != NULL && token_count < 64) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, " \t\n");
+    }
+
+    if (token_count < 2) {
+        fprintf(stderr, "Error: Invalid entry format\n");
+        return -1;
+    }
+
+    // Extract the balance
+    int balance_pos = 0;
+    int balance = get_balance(buffer, &balance_pos);
+    printf("DEBUG: balance : %d\n", balance);
+
+    // Update the balance
+    if (OP == 'D') {
+        balance += amount;
+    } else if (OP == 'W') {
+        if (amount > balance) {
+            fprintf(stderr, "Error: Insufficient balance for withdrawal\n");
+            return -1;
+        }
+        balance -= amount;
+    }
+
+    // Build the updated entry
+    char updated_entry[256];
+    int pos = 0;
+
+    // Start with the bank ID
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, "%s", tokens[0]);
+
+    // Copy all the middle tokens (transaction history)
+    for (int i = 1; i < token_count - 1; i++) {
+        pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %s", tokens[i]);
+    }
+
+    // Add new transaction
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %c %d", OP, amount);
+
+    // Add updated balance
+    pos += snprintf(updated_entry + pos, sizeof(updated_entry) - pos, " %d\n", balance);
+
+    // Ensure null-termination
+    updated_entry[sizeof(updated_entry) - 1] = '\0';
+    printf("DEBUG: updated_entry : %s\n", updated_entry);
+
+    // Rewrite the entire file
     FILE *db_file = fopen(DATABASE, "r");
     if (db_file == NULL) {
-        perror("Error opening database");
-        fclose(temp);
-        unlink(temp_file);
+        perror("Error opening database for reading");
+        return -1;
+    }
+
+    FILE *temp_file = fopen("temp.db", "w");
+    if (temp_file == NULL) {
+        perror("Error creating temporary file");
+        fclose(db_file);
         return -1;
     }
 
     char line[256];
-    int found = 0;
-
-    // Process each line in the database
     while (fgets(line, sizeof(line), db_file) != NULL) {
-        char bank_name[64];
-        int id, balance;
-
-        // Parse the line
-        if (sscanf(line, "%s %d %d", bank_name, &id, &balance) == 3) {
-            // Check if this is the record we want to update
-            if (strcmp(bank_name, updated_client->bankName) == 0) {
-                // Write the updated record instead
-                fprintf(temp, "%s %d %d\n", updated_client->bankName,
-                        updated_client->id, updated_client->balance);
-                found = 1;
-            } else {
-                // Write the original record
-                fprintf(temp, "%s", line);
-            }
+        // Check if this is the line to update
+        if (strstr(line, bankName) == line) {
+            fprintf(temp_file, "%s", updated_entry);  // Write the updated entry
         } else {
-            // Write the line as is if it doesn't match our expected format
-            fprintf(temp, "%s", line);
+            fprintf(temp_file, "%s", line);  // Write the original line
         }
     }
 
-    // Close both files
     fclose(db_file);
-    fclose(temp);
+    fclose(temp_file);
 
-    // If the record was found and updated, replace the original file
-    if (found) {
-        if (rename(temp_file, DATABASE) != 0) {
-            perror("Error replacing database file");
-            unlink(temp_file);
-            return -1;
-        }
-        printf("DEBUG: Updated record for %s\n", updated_client->bankName);
-        int ret;
-        sscanf(updated_client->bankName, "%*s_%d",
-               &ret);  // Parse the entry back to get the ID
-        printf("DEBUG: Updatedb returnID %d\n", ret);
-        return ret;  // Return ID on success
-    } else {
-        // Record not found, remove the temporary file
-        unlink(temp_file);
+    // Replace the original file with the updated file
+    if (rename("temp.db", DATABASE) == -1) {
+        perror("Error replacing database file");
         return -1;
     }
+
+    return 0;  // Success
+}
+int get_balance(const char *line, int *pos) {
+    int balance = 0;
+
+    // Find the last digit in the string by traversing backward
+    int len = strlen(line);
+    int i = len - 1;
+
+    // Skip non-digit characters from the end
+    while (i >= 0 && !isdigit(line[i])) {
+        i--;
+    }
+
+    // Find the start of the last number
+    int end = i;
+    while (i >= 0 && isdigit(line[i])) {
+        i--;
+    }
+
+    // Extract the last number (balance)
+    if (end >= 0) {
+        sscanf(&line[i + 1], "%d", &balance);
+        *pos = i + 1;  // Set the position to the start of the last number
+    } else {
+        balance = 0;  // Default if no number is found
+    }
+    return balance;
 }
 
 int remove_from_db(const char *bankName) {
-    // Open a temporary file for writing
-    char temp_file[256];
-    sprintf(temp_file, "%s.tmp", DATABASE);
-    FILE *temp = fopen(temp_file, "w");
-    if (temp == NULL) {
-        perror("Error creating temporary file");
+    if (bankName == NULL) {
+        fprintf(stderr, "Error: bankName is NULL\n");
         return -1;
     }
 
-    // Open the original database file for reading
+    // Open the database file for reading
     FILE *db_file = fopen(DATABASE, "r");
     if (db_file == NULL) {
-        perror("Error opening database");
-        fclose(temp);
-        unlink(temp_file);
+        perror("Error opening database for reading");
+        return -1;
+    }
+
+    // Open a temporary file for writing
+    FILE *temp_file = fopen("temp.db", "w");
+    if (temp_file == NULL) {
+        perror("Error creating temporary file");
+        fclose(db_file);
         return -1;
     }
 
     char line[256];
     int found = 0;
-    int removed_id = -1;
 
-    // Process each line in the database
+    // Read the database line by line
     while (fgets(line, sizeof(line), db_file) != NULL) {
-        char bank_name[64];
-        int id, balance;
-
-        // Parse the line
-        if (sscanf(line, "%s %d %d", bank_name, &id, &balance) == 3) {
-            // Check if this is the record we want to remove
-            if (strcmp(bank_name, bankName) == 0) {
-                found = 1;
-                removed_id = id;
-                // Skip this line (don't write it to the temp file)
-            } else {
-                // Write the record to the temp file
-                fprintf(temp, "%s", line);
-            }
+        // Check if this is the line to remove
+        if (strstr(line, bankName) == line) {
+            // Comment out the line
+            fprintf(temp_file, "# %s", line);
+            found = 1;
         } else {
-            // Write the line as is if it doesn't match our expected format
-            fprintf(temp, "%s", line);
+            // Write the original line
+            fprintf(temp_file, "%s", line);
         }
     }
 
-    // Close both files
     fclose(db_file);
-    fclose(temp);
+    fclose(temp_file);
 
-    // If the record was found and removed, replace the original file
-    if (found) {
-        if (rename(temp_file, DATABASE) != 0) {
-            perror("Error replacing database file");
-            unlink(temp_file);
-            return -1;
-        }
-        int ret;
-        sscanf(bankName, "%*s_%d", &ret);  // Parse the entry back to get the ID
-        printf("DEBUG: Removed returnID %d\n", ret);
-        return ret;  // Return ID on success
-    } else {
-        // Record not found, remove the temporary file
-        unlink(temp_file);
+    if (!found) {
+        // If no matching record was found, remove the temporary file
+        unlink("temp.db");
+        fprintf(stderr, "Error: Entry not found for %s\n", bankName);
+        return -1;  // Entry not found
+    }
+
+    // Replace the original file with the updated file
+    if (rename("temp.db", DATABASE) == -1) {
+        perror("Error replacing database file");
         return -1;
     }
+
+    return 0;  // Success
 }
