@@ -731,6 +731,12 @@ void cleanup_and_exit() {
     unlink(CLIENT_FIFO);  // Remove the FIFO
     cleanup_shared_memory();
     printf("Removing ServerFIFO… Updating log file…\n");
+    char timestr[64];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(timestr, sizeof(timestr), "%H:%M %B %d %Y", tm_info);
+
+    update_db_timestamp(timestr);
     printf("Adabank says “Bye”…\n");
     exit(0);
 }
@@ -1150,12 +1156,86 @@ int remove_from_db(const char *bankName) {
     return 0;  // Success
 }
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
 
-int update_db_timestamp(const char *timetamp) {
-    int db_fd = open(DATABASE, O_WRONLY | O_APPEND);
+int update_db_timestamp(const char *timestamp) {
+    int db_fd = open(DATABASE, O_RDONLY);
     if (db_fd == -1) {
         perror("Error opening database");
         return -1;
     }
-    // write to first line, commented
+
+    int temp_fd = open("temp.db", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (temp_fd == -1) {
+        perror("Error creating temporary file");
+        close(db_fd);
+        return -1;
+    }
+
+    char buffer[256];
+    ssize_t bytes_read;
+
+    // Write the new timestamp as the first line
+    char timestamp_line[256];
+    snprintf(timestamp_line, sizeof(timestamp_line), "# Adabank Log file updated @%s\n", timestamp);
+    if (write(temp_fd, timestamp_line, strlen(timestamp_line)) == -1) {
+        perror("Error writing timestamp to temporary file");
+        close(db_fd);
+        close(temp_fd);
+        return -1;
+    }
+
+    // Read the first line of the original file
+    bytes_read = read(db_fd, buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0'; // Null-terminate the buffer
+        char *newline_pos = strchr(buffer, '\n');
+        if (newline_pos != NULL) {
+            *newline_pos = '\0'; // Null-terminate the first line
+            if (buffer[0] != '#') {
+                // If the first line does not start with '#', write it to the temp file
+                if (write(temp_fd, buffer, strlen(buffer)) == -1 ||
+                    write(temp_fd, "\n", 1) == -1) {
+                    perror("Error writing to temporary file");
+                    close(db_fd);
+                    close(temp_fd);
+                    return -1;
+                }
+            }
+            // Move the file descriptor to the start of the next line
+            lseek(db_fd, newline_pos - buffer + 1, SEEK_SET);
+        }
+    }
+
+    // Copy the rest of the original file to the temporary file
+    while ((bytes_read = read(db_fd, buffer, sizeof(buffer))) > 0) {
+        if (write(temp_fd, buffer, bytes_read) == -1) {
+            perror("Error writing to temporary file");
+            close(db_fd);
+            close(temp_fd);
+            return -1;
+        }
+    }
+
+    if (bytes_read == -1) {
+        perror("Error reading from database");
+        close(db_fd);
+        close(temp_fd);
+        return -1;
+    }
+
+    close(db_fd);
+    close(temp_fd);
+
+    // Replace the original file with the updated file
+    if (rename("temp.db", DATABASE) == -1) {
+        perror("Error replacing database file");
+        return -1;
+    }
+
+    return 0; // Success
 }
