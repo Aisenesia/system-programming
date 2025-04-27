@@ -14,7 +14,8 @@
 
 #include "common.h"  // Include the Teller library
 
-#define DATABASE "files/adabank.db"
+#define DATABASE "logs/AdaBank.bankLog"
+
 
 #define DEBUG_MODE 0
 
@@ -51,6 +52,11 @@ int get_db_command(CommandQueue *queue, DatabaseCommand *cmd);
 
 void *deposit(void *arg);
 void *withdraw(void *arg);
+
+// Backup and restore functions
+int restore_backup();
+void take_backup();
+void delete_backup();
 
 // Global variables
 int server_fifo_fd = -1;
@@ -217,7 +223,7 @@ int main() {
         // wait for tellers
         for(int i = tellers_head; i != tellers_tail; i = (i + 1) % MAX_CLIENTS) {
             int status;
-            pid_t result = waitpid(tellers[i], &status, WNOHANG);
+            pid_t result = waitTeller(tellers[i], &status);
             if (result == -1) {
                 perror("Error waiting for teller process");
             } else if (result > 0) {
@@ -264,7 +270,7 @@ int allocate_transaction() {
             shared_mem->transactionManager.transactions[i].completed = 0;
             shared_mem->transactionManager.transactions[i].result =
                 -2;  // Pending
-                printf("DEBUG: Allocating transaction %d\n", i);
+                // printf("DEBUG: Allocating transaction %d\n", i);
             transaction_id = i;
             break;
         }
@@ -280,8 +286,7 @@ void complete_transaction(int transaction_id, int result) {
 
     sem_wait(&shared_mem->transactionManager.mutex);
 
-    printf("DEBUG: Completing transaction %d with result %d\n",
-           transaction_id, result);
+    //printf("DEBUG: Completing transaction %d with result %d\n", transaction_id, result);
 
     shared_mem->transactionManager.transactions[transaction_id].result = result;
     shared_mem->transactionManager.transactions[transaction_id].completed = 1;
@@ -341,6 +346,7 @@ pid_t teller_function(ClientRequest *request) {
 void *deposit(void *arg) {
     ClientRequest *request = (ClientRequest *)arg;
     ServerResponse response;
+    memset(&response, 0, sizeof(response));
     char teller_fifo[64];
 
     // Create a unique FIFO for this teller
@@ -407,7 +413,7 @@ void *deposit(void *arg) {
 
 send_response:;
     // Send the response through the FIFO
-    int teller_fd = open(teller_fifo, O_WRONLY);
+    int teller_fd = open(teller_fifo, O_WRONLY | O_NONBLOCK);
     if (teller_fd != -1) {
         write(teller_fd, &response, sizeof(response));
         close(teller_fd);
@@ -421,6 +427,7 @@ send_response:;
 void *withdraw(void *arg) {
     ClientRequest *request = (ClientRequest *)arg;
     ServerResponse response;
+    memset(&response, 0, sizeof(response));
     char teller_fifo[64];
 
     // Create a unique FIFO for this teller
@@ -736,7 +743,25 @@ void cleanup_and_exit() {
     struct tm *tm_info = localtime(&now);
     strftime(timestr, sizeof(timestr), "%H:%M %B %d %Y", tm_info);
 
+    // delete all the client_fifo_id up to the current teller id giver if they exist
+    for (int i = 1; i < teller_id_giver; i++) {
+        char client_fifo[64];
+        snprintf(client_fifo, sizeof(client_fifo), "%s_%d", CLIENT_FIFO, i);
+        unlink(client_fifo);
+    }
+
+    char backup_file[64];
+    snprintf(backup_file, sizeof(backup_file), "%s.bak", DATABASE);
+    // check if the backup file exists
+    if (access(backup_file, F_OK) == 0) {
+        printf("Interrupted on DB Write, restoring the backup\n");
+        restore_backup();
+    }
+
     update_db_timestamp(timestr);
+
+    
+
     printf("Adabank says “Bye”…\n");
     exit(0);
 }
@@ -894,6 +919,7 @@ int get_available_bank_name() {
     return last_bank_id + 1;  // Return the next available bank ID
 }
 int add_to_db(DatabaseEntry req) {
+    take_backup();
     int db_fd = open(DATABASE, O_WRONLY | O_APPEND);
     if (db_fd == -1) {
         perror("Error opening database");
@@ -910,10 +936,12 @@ int add_to_db(DatabaseEntry req) {
         return -1;
     }
     close(db_fd);  // Close the database file
+    delete_backup();
     return 0;      // Return 0
 }
 
 int update_db(DatabaseEntry entry, char OP, int amount) {
+    take_backup();
     if (OP != 'D' && OP != 'W') {
         fprintf(stderr, "Error: Invalid operation '%c'\n", OP);
         return -1;
@@ -1069,7 +1097,7 @@ int update_db(DatabaseEntry entry, char OP, int amount) {
         perror("Error replacing database file");
         return -1;
     }
-
+    delete_backup();
     return 0;  // Success
 }
 int get_balance(const char *line, int *pos) {
@@ -1101,6 +1129,7 @@ int get_balance(const char *line, int *pos) {
 }
 
 int remove_from_db(const char *bankName) {
+    take_backup();  // Create a backup before modifying the database
     if (bankName == NULL) {
         fprintf(stderr, "Error: bankName is NULL\n");
         return -1;
@@ -1153,14 +1182,9 @@ int remove_from_db(const char *bankName) {
         return -1;
     }
 
+    delete_backup();  // Remove the backup file
     return 0;  // Success
 }
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
 
 int update_db_timestamp(const char *timestamp) {
     int db_fd = open(DATABASE, O_RDONLY);
@@ -1234,6 +1258,69 @@ int update_db_timestamp(const char *timestamp) {
     // Replace the original file with the updated file
     if (rename("temp.db", DATABASE) == -1) {
         perror("Error replacing database file");
+        return -1;
+    }
+
+    return 0; // Success
+}
+
+void take_backup() {
+    // Create a backup of the database
+    char backup_file[256];
+    snprintf(backup_file, sizeof(backup_file), "%s.bak", DATABASE);
+    int db_fd = open(DATABASE, O_RDONLY);
+    if (db_fd == -1) {
+        perror("Error opening database for backup");
+        return;
+    }
+
+    int backup_fd = open(backup_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (backup_fd == -1) {
+        perror("Error creating backup file");
+        close(db_fd);
+        return;
+    }
+
+    char buffer[256];
+    ssize_t bytes_read;
+
+    // Copy the database to the backup file
+    while ((bytes_read = read(db_fd, buffer, sizeof(buffer))) > 0) {
+        if (write(backup_fd, buffer, bytes_read) == -1) {
+            perror("Error writing to backup file");
+            break;
+        }
+    }
+
+    if (bytes_read == -1) {
+        perror("Error reading from database");
+    }
+
+    close(db_fd);
+    close(backup_fd);
+}
+
+void delete_backup() {
+    // Delete the backup file
+    char backup_file[256];
+    snprintf(backup_file, sizeof(backup_file), "%s.bak", DATABASE);
+    unlink(backup_file); // silently ignore if it doesn't exist
+}
+
+int restore_backup() {
+    // Restore the database by renaming the backup file
+    char backup_file[256];
+    snprintf(backup_file, sizeof(backup_file), "%s.bak", DATABASE);
+
+    // Check if the backup file exists
+    if (access(backup_file, F_OK) != 0) {
+        fprintf(stderr, "Error: Backup file does not exist\n");
+        return -1;
+    }
+
+    // Rename the backup file to the database file
+    if (rename(backup_file, DATABASE) == -1) {
+        perror("Error renaming backup file to database");
         return -1;
     }
 

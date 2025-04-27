@@ -12,7 +12,6 @@
 #define MAX_CLIENTS 20
 #define SERVER_FIFO "server_fifo" // FIFO name
 #define SHM_NAME "AdaBankSharedMemory"
-#define LOG_FILE "logs/AdaBank.bankLog"
 #define CLIENT_FIFO "client_fifo" 
 
 

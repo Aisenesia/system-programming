@@ -8,28 +8,8 @@
 
 #include "common.h"
 
-// Reads a client file (A batch job, connect to the server fifo)
-
-/* example client file (client01.file)
-
-N deposit 300 // New account, deposit 300, if there is no previous account it
-will be created as BankID_01 BankID_None withdraw 30 // Withdraw 30 from account
-BankID_None, it will fail N deposit 2000 // New account, deposit 2000
-
-another file Client02.FILE
-
-BankID_01 withdraw 300 // if we execute cclient01.file first, this will succeed
-N deposit 20 // New account, deposit 20
-
-
-another file:
-BankID_02 withdraw 30 // since BankID_02 created with deposit 20, this will fail
-since there is not enough money N deposit 2000 BankID_02 deposit 200 BankID_02
-withdraw 300 N withdraw 20
-
-
-*/
 ClientRequest generateRequestFromLine(int clid, char* line);
+int wait_for_server_fifo();
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -69,18 +49,25 @@ int main(int argc, char* argv[]) {
     // read client starting id from server fifo.
     int client_fifo_fd = open(CLIENT_FIFO, O_RDONLY);
     if (client_fifo_fd == -1) {
-        perror("client_fifo_fd opening server FIFO");
+        char err[64];
+        sprintf(err, "Cannot connect %s\n", SERVER_FIFO);
+        printf(err);
         return 1;
     }
     int client_id;
+
+    // TODO, if another client is already connected, we should wait for it to finish, we can try to open for read non-blocking
+    // if it does not block, there is another client connected, we should wait for it to finish
+    if (wait_for_server_fifo() == -1) {
+        return 1; // Error waiting for server FIFO
+    }
+
 
     if (read(client_fifo_fd, &client_id, sizeof(client_id)) == -1) {
         perror("Error writing to client FIFO");
         close(client_fifo_fd);
         return 1;
     }
-
-    
 
     close(client_fifo_fd);
     printf("Connected to Adabank..\n");
@@ -154,4 +141,28 @@ ClientRequest generateRequestFromLine(int clid, char* line) {
     }
 
     return request;
+}
+
+int wait_for_server_fifo() {
+    int server_fifo_fd;
+    while (1) {
+        // Try to open the server FIFO in non-blocking mode
+        server_fifo_fd = open(SERVER_FIFO, O_RDONLY | O_NONBLOCK);
+        if (server_fifo_fd != -1) {
+            // Successfully opened, no other client is writing
+            close(server_fifo_fd);
+            break;
+        }
+
+        // Check if the error is due to the FIFO being busy
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            printf("Another client is connected. Waiting...\n");
+            usleep(100000); // Wait for 100ms before retrying
+        } else {
+            // Some other error occurred
+            perror("Error opening server FIFO");
+            return -1;
+        }
+    }
+    return 0;
 }
