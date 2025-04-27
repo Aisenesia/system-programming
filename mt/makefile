@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -g -Iinclude
 # -Iinclude is used to include the header files from the include directory
-LDFLAGS = 
+LDFLAGS = -pthread -lrt
 
 all: server client
 
