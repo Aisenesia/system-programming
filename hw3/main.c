@@ -268,7 +268,7 @@ void *engineer(void *arg) {
         printf("[ENGINEER %d] Handling Satellite %d (Priority %d)\n", id, request->satellite_id, request->priority);
         pthread_mutex_unlock(&engineerMutex);
 
-        sleep(rand () % 5 + 1); // Simulate work
+        sleep(10 + 1); // Simulate work
 
         printf("[ENGINEER %d] Finished Satellite %d\n", id, request->satellite_id);
         pthread_mutex_lock(&handlingMutex);
