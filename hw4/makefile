@@ -12,7 +12,9 @@ main: 220104004073_main.c buffer.h buffer.c
 
 d:
 	@clear
-	@gcc -g -o deb 220104004073_main.c
+	@gcc -g -o deb 220104004073_main.c buffer.c
+
+dr: d
 	@gdb deb
 v:
 	@clear

@@ -5,8 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>  // For sleep and random simulation
 
 #include "buffer.h"
 #define MAX_LINE_LENGTH 1024
@@ -23,6 +21,9 @@ pthread_barrier_t barrier;
 volatile int total_matches = 0;
 pthread_mutex_t match_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile int eof_reached = 0;
+volatile int terminate = 0;
+pthread_t manager;
+pthread_t *workers;
 
 // -------------------- Function Declarations --------------------
 void handleSigint(int sig);
@@ -56,8 +57,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handleSigint);
 
     // Create manager and worker threads
-    pthread_t manager;
-    pthread_t workers[num_workers];
+    workers = malloc(num_workers * sizeof(pthread_t));
 
     if (pthread_create(&manager, NULL, managerThread, log_file) != 0) {
         perror("Failed to create manager thread");
@@ -89,6 +89,7 @@ int main(int argc, char *argv[]) {
     destroyBuffer(&sharedBuffer);
     pthread_barrier_destroy(&barrier);
     pthread_mutex_destroy(&match_mutex);
+    free(workers);
 
     return 0;
 }
@@ -99,6 +100,15 @@ void *managerThread(void *arg) {
     FILE *file = fopen(log_file, "r");
     if (!file) {
         perror("Failed to open log file");
+
+        // we do not have a way to ensure that manager starts before workers, so we cannot stop them, what we can do is
+        // add EOF markers to the buffer for each worker
+        // and let them finish
+
+        for (int i = 0; i < num_workers; i++) {
+            addToBuffer(&sharedBuffer, NULL);
+        }
+
         pthread_exit(NULL);
     }
 
@@ -117,7 +127,6 @@ void *managerThread(void *arg) {
         addToBuffer(&sharedBuffer, NULL);
     }
 
-    eof_reached = 1;
     fclose(file);
     pthread_exit(NULL);
 }
@@ -158,8 +167,35 @@ void *workerThread(void *arg) {
 // Signal handler function
 void handleSigint(int sig) {
     printf("\nCaught signal %d. Exiting...\n", sig);
+
+    terminate = 1;
+
+    // Wake up all waiting threads
+    pthread_mutex_lock(&sharedBuffer.mutex);
+    pthread_cond_broadcast(&sharedBuffer.not_empty);
+    pthread_mutex_unlock(&sharedBuffer.mutex);
+
+    // Check if threads are initialized before joining
+    if (workers != NULL) {
+        for (int i = 0; i < num_workers; i++) {
+            if (workers[i] != 0) {
+                pthread_join(workers[i], NULL);
+            }
+        }
+    }
+
+    if (manager != 0) {
+        pthread_join(manager, NULL);
+    }
+
+    // Clean up resources
     destroyBuffer(&sharedBuffer);
     pthread_barrier_destroy(&barrier);
     pthread_mutex_destroy(&match_mutex);
+
+    if (workers != NULL) {
+        free(workers);
+    }
+
     exit(0);
 }

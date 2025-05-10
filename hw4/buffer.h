@@ -26,4 +26,6 @@ void destroyBuffer(SharedBuffer *buf);
 void addToBuffer(SharedBuffer *buf, char *line);
 char *removeFromBuffer(SharedBuffer *buf);
 
+
+
 #endif
