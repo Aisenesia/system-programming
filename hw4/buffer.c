@@ -1,3 +1,6 @@
+#include "buffer.h"
+
+
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -6,19 +9,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MAX_LINE_LENGTH 1024
-
-// Shared buffer structure
-typedef struct {
-    char **buffer;
-    int size;
-    int start;
-    int end;
-    int count;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-} SharedBuffer;
 
 // Function to initialize the shared buffer
 void initBuffer(SharedBuffer *buf, int size) {
@@ -57,9 +47,13 @@ void destroyBuffer(SharedBuffer *buf) {
 // Add a line to the buffer
 void addToBuffer(SharedBuffer *buf, char *line) {
     pthread_mutex_lock(&buf->mutex);
-
-    while (buf->count == buf->size) {
+    while (buf->count == buf->size && !terminate) {
         pthread_cond_wait(&buf->not_full, &buf->mutex);
+    }
+    if (terminate) {
+        pthread_mutex_unlock(&buf->mutex);
+        free(line);
+        return;
     }
 
     buf->buffer[buf->end] = line;
@@ -70,16 +64,19 @@ void addToBuffer(SharedBuffer *buf, char *line) {
     pthread_mutex_unlock(&buf->mutex);
 }
 
-// Remove a line from the buffer
 char *removeFromBuffer(SharedBuffer *buf) {
     pthread_mutex_lock(&buf->mutex);
-
-    while (buf->count == 0) {
+    while (buf->count == 0 && !terminate) {
         pthread_cond_wait(&buf->not_empty, &buf->mutex);
     }
 
+    if (terminate && buf->count == 0) {
+        pthread_mutex_unlock(&buf->mutex);
+        return NULL;
+    }
+
     char *line = buf->buffer[buf->start];
-    buf->buffer[buf->start] = NULL;  // Clear the pointer
+    buf->buffer[buf->start] = NULL;
     buf->start = (buf->start + 1) % buf->size;
     buf->count--;
 
