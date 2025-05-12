@@ -51,6 +51,8 @@ void addToBuffer(SharedBuffer *buf, char *line) {
         pthread_cond_wait(&buf->not_full, &buf->mutex);
     }
     if (terminate) {
+        pthread_cond_broadcast(&buf->not_full);
+        pthread_cond_broadcast(&buf->not_empty);
         pthread_mutex_unlock(&buf->mutex);
         free(line);
         return;
@@ -71,6 +73,8 @@ char *removeFromBuffer(SharedBuffer *buf) {
     }
 
     if (terminate && buf->count == 0) {
+        pthread_cond_broadcast(&buf->not_full);
+        pthread_cond_broadcast(&buf->not_empty);
         pthread_mutex_unlock(&buf->mutex);
         return NULL;
     }
