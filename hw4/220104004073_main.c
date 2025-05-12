@@ -17,7 +17,7 @@ int num_workers;
 char *search_term;
 SharedBuffer sharedBuffer;
 pthread_barrier_t barrier;
-volatile int total_matches = 0;
+volatile unsigned long total_matches = 0;
 pthread_mutex_t match_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile int eof_reached = 0;
 
@@ -42,14 +42,13 @@ int main(int argc, char *argv[]) {
             "<search_term>\n");
         return 1;
     }
-    // what if user inputted a char to size?
-    // what if user inputted a char to num_workers?
 
-    // Add validation for numeric arguments
+    // Validate numeric arguments (what if they are not integers?, negative?)
     char *endptr;
 
     // Validate buffer_size
-    long buffer_size = strtol(argv[1], &endptr, 10);
+    long buffer_size = strtol(argv[1], &endptr,
+                              10);  // not more than 10 characters (1000000000)
     if (*endptr != '\0' || buffer_size <= 0) {
         printf("Error: buffer_size must be a positive integer.\n");
         return 1;
@@ -125,11 +124,11 @@ int main(int argc, char *argv[]) {
     if (terminate)
         printf(
             "Termination signal received, workers may not have completed. "
-            "Current Total Matches: %d\n",
+            "Current Total Matches: %ld\n",
             total_matches);
 
     else
-        printf("All workers have finished. Total matches found: %d\n",
+        printf("All workers have finished. Total matches found: %ld\n",
                total_matches);
 
     // Now wait for threads to complete
@@ -243,7 +242,9 @@ void *workerThread(void *arg) {
         }
 
         DEBUG_PRINT("[DEBUG] Worker %d: Processing line.\n", id);
-        if (strstr(line, search_term)) {
+        if (strstr(line,
+                   search_term)) {  // this wont detect multiple matches, but im
+                                    // not sure whether that is what was wanted.
             match_count++;
         }
         free(line);
@@ -259,7 +260,6 @@ void *workerThread(void *arg) {
 
     printf("Worker %d found %d matches.\n", id, match_count);
 
-    // Add debug logs to track barrier synchronization
     DEBUG_PRINT("[DEBUG] Worker %d: Waiting at barrier.\n", id);
     pthread_barrier_wait(&barrier);
     DEBUG_PRINT("[DEBUG] Worker %d: Passed the barrier.\n", id);
