@@ -21,6 +21,15 @@
 #define COLOR_CYAN    "\033[96m"
 #define COLOR_WHITE   "\033[97m"
 #define COLOR_RESET   "\033[0m"
+#define COLOR_DEBUG   "\033[90m"
+
+#define DEBUG 1
+
+#if DEBUG
+#define debug_print(fmt, ...) printf(COLOR_DEBUG fmt COLOR_RESET, ##__VA_ARGS__)
+#else
+#define debug_print(fmt, ...)
+#endif
 
 typedef struct {
     int socket;
@@ -44,9 +53,11 @@ void disconnect_from_server(void);
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     if (sig == SIGINT) {
-        printf("\n");
         print_colored("Disconnecting...", COLOR_YELLOW);
+        debug_print("[DEBUG] SIGINT received, shutting down client...\n");
+        client.running = 0;
         disconnect_from_server();
+        exit(0); // Ensure the program terminates
     }
 }
 
@@ -65,14 +76,6 @@ void show_help(void) {
     print_colored("/exit                 - Disconnect from server", COLOR_CYAN);
     print_colored("/help                 - Show this help message", COLOR_CYAN);
 }
-
-#define DEBUG 0
-
-#if DEBUG
-#define debug_print(fmt, ...) printf(fmt, ##__VA_ARGS__)
-#else
-#define debug_print(fmt, ...)
-#endif
 
 void process_message(const char *message_str) {
     debug_print("[DEBUG] Raw message received: %s\n", message_str);
