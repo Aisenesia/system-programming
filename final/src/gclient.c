@@ -7,6 +7,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <time.h>
+#include <sys/select.h>
 #include <errno.h>
 
 #define BUFFER_SIZE 2048
@@ -179,34 +181,54 @@ void process_message(const char *message_str) {
 void* receive_messages(void *arg) {
     char buffer[BUFFER_SIZE];
     char message_buffer[BUFFER_SIZE * 2] = {0};
-    int bytes_received;
-    
+
+    fd_set read_fds;
+    struct timeval timeout;
+
     while (client.running) {
-        bytes_received = recv(client.socket, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_received <= 0) {
-            if (client.running) {
-                print_colored("Connection lost", COLOR_RED);
-            }
+        FD_ZERO(&read_fds);
+        FD_SET(client.socket, &read_fds);
+
+        timeout.tv_sec = 1;  // 1 second timeout
+        timeout.tv_usec = 0;
+
+        int activity = select(client.socket + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (activity < 0 && errno != EINTR) {
+            perror("select error");
             break;
         }
-        
-        buffer[bytes_received] = '\0';
-        strcat(message_buffer, buffer);
-        
-        // Process complete messages (ending with newline)
-        char *newline_pos;
-        while ((newline_pos = strchr(message_buffer, '\n')) != NULL) {
-            *newline_pos = '\0';
-            
-            if (strlen(message_buffer) > 0) {
-                process_message(message_buffer);
+
+        if (activity == 0) {
+            // Timeout, no data, check if we should still run
+            continue;
+        }
+
+        if (FD_ISSET(client.socket, &read_fds)) {
+            int bytes_received = recv(client.socket, buffer, sizeof(buffer) - 1, 0);
+            if (bytes_received <= 0) {
+                if (client.running) {
+                    print_colored("Connection lost or closed by server", COLOR_RED);
+                }
+                break;
             }
-            
-            // Move remaining data to beginning of buffer
-            memmove(message_buffer, newline_pos + 1, strlen(newline_pos + 1) + 1);
+
+            buffer[bytes_received] = '\0';
+            strcat(message_buffer, buffer);
+
+            // Process complete messages (ending with newline)
+            char *newline_pos;
+            while ((newline_pos = strchr(message_buffer, '\n')) != NULL) {
+                *newline_pos = '\0';
+                if (strlen(message_buffer) > 0) {
+                    process_message(message_buffer);
+                }
+                // Move remaining data to beginning of buffer
+                memmove(message_buffer, newline_pos + 1, strlen(newline_pos + 1) + 1);
+            }
         }
     }
-    
+
     return NULL;
 }
 
