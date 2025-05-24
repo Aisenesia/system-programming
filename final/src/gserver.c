@@ -25,6 +25,9 @@
 #define MAX_FILE_SIZE (3 * 1024 * 1024) // 3MB
 #define FILES_DIR "files"
 
+// TODO: if no recipient is offline or not found, wrong command messages appear
+// TODO: if a recipient is not in a room or in a different one, it still sends the file to the recipient succesfully instead of returning an error
+
 // Client structure
 typedef struct {
     int socket;
