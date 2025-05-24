@@ -4,3 +4,4 @@ files/*
 gserver
 gclient
 server_log_*
+test

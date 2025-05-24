@@ -10,9 +10,11 @@
 #include <time.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #define BUFFER_SIZE 2048
 #define MAX_MESSAGE_LEN 1024
+#define MAX_FILE_SIZE (3 * 1024 * 1024) // 3MB
 
 // ANSI color codes
 #define COLOR_RED     "\033[91m"
@@ -45,6 +47,8 @@ client_t client = {0};
 void signal_handler(int sig);
 void print_colored(const char *text, const char *color);
 void show_help(void);
+int validate_file(const char *filename);
+int get_file_size(const char *filename);
 char* extract_json_value(const char *json, const char *key);
 void process_message(const char *message_str);
 void* receive_messages(void *arg);
@@ -75,6 +79,7 @@ void show_help(void) {
     print_colored("/leave                - Leave current room", COLOR_CYAN);
     print_colored("/broadcast <message>  - Send message to everyone in current room", COLOR_CYAN);
     print_colored("/whisper <user> <msg> - Send private message to user", COLOR_CYAN);
+    print_colored("/sendfile <file> <user> - Send file to user (max 3MB, .txt/.pdf/.jpg/.png)", COLOR_CYAN);
     print_colored("/exit                 - Disconnect from server", COLOR_CYAN);
     print_colored("/help                 - Show this help message", COLOR_CYAN);
 }
@@ -166,6 +171,90 @@ void process_message(const char *message_str) {
     } else if (strcmp(type, "notification") == 0) {
         snprintf(formatted_message, sizeof(formatted_message), "[INFO] %s", content);
         print_colored(formatted_message, COLOR_BLUE);
+    } else if (strcmp(type, "file_request") == 0) {
+        snprintf(formatted_message, sizeof(formatted_message), "[FILE REQUEST] %s", content);
+        print_colored(formatted_message, COLOR_CYAN);
+    } else if (strcmp(type, "file_incoming") == 0) {
+        // Handle incoming file notification - file is created directly by server
+        snprintf(formatted_message, sizeof(formatted_message), "[FILE INCOMING] %s", content);
+        print_colored(formatted_message, COLOR_CYAN);
+        
+        // No need to receive file data - server creates the file directly
+        print_colored("[INFO] File is being prepared by server...", COLOR_CYAN);
+    } else if (strcmp(type, "file_transfer_start") == 0) {
+        // Handle file transfer start - extract filename, sender, and size
+        char filename[256] = {0}, sender[64] = {0};
+        size_t file_size = 0;
+        
+        // Parse content: "FILE_TRANSFER_START:filename:sender:size"
+        if (sscanf(content, "FILE_TRANSFER_START:%255[^:]:%63[^:]:%zu", filename, sender, &file_size) == 3) {
+            snprintf(formatted_message, sizeof(formatted_message), 
+                     "[FILE INCOMING] Receiving '%s' from %s (%.1f KB)...", 
+                     filename, sender, (float)file_size / 1024);
+            print_colored(formatted_message, COLOR_CYAN);
+            
+            // Prepare to receive file data
+            FILE *file = fopen(filename, "wb");
+            if (!file) {
+                print_colored("[ERROR] Cannot create file for writing", COLOR_RED);
+                return;
+            }
+            
+            char file_buffer[8192];
+            size_t bytes_received = 0;
+            size_t bytes_to_read;
+            
+            print_colored("[INFO] Receiving file data...", COLOR_CYAN);
+            
+            // Receive file data in chunks
+            while (bytes_received < file_size) {
+                bytes_to_read = (file_size - bytes_received > sizeof(file_buffer)) ? 
+                               sizeof(file_buffer) : (file_size - bytes_received);
+                
+                int received = recv(client.socket, file_buffer, bytes_to_read, 0);
+                if (received <= 0) {
+                    print_colored("[ERROR] Connection lost during file transfer", COLOR_RED);
+                    fclose(file);
+                    unlink(filename); // Remove incomplete file
+                    return;
+                }
+                
+                if (fwrite(file_buffer, 1, received, file) != (size_t)received) {
+                    print_colored("[ERROR] Failed to write file data", COLOR_RED);
+                    fclose(file);
+                    unlink(filename); // Remove incomplete file
+                    return;
+                }
+                
+                bytes_received += received;
+            }
+            
+            fclose(file);
+            
+            if (bytes_received == file_size) {
+                snprintf(formatted_message, sizeof(formatted_message), 
+                         "[FILE SUCCESS] File '%s' received from %s (%.1f KB) - saved locally", 
+                         filename, sender, (float)bytes_received / 1024);
+                print_colored(formatted_message, COLOR_GREEN);
+            } else {
+                print_colored("[ERROR] File transfer incomplete", COLOR_RED);
+                unlink(filename); // Remove incomplete file
+            }
+        } else {
+            print_colored("[ERROR] Invalid file transfer start message", COLOR_RED);
+        }
+    } else if (strcmp(type, "file_transfer_end") == 0) {
+        // Handle file transfer completion notification
+        char filename[256] = {0};
+        size_t file_size = 0;
+        
+        // Parse content: "FILE_TRANSFER_END:filename:size"
+        if (sscanf(content, "FILE_TRANSFER_END:%255[^:]:%zu", filename, &file_size) == 2) {
+            snprintf(formatted_message, sizeof(formatted_message), 
+                     "[FILE COMPLETE] Transfer of '%s' completed (%.1f KB)", 
+                     filename, (float)file_size / 1024);
+            print_colored(formatted_message, COLOR_GREEN);
+        }
     } else {
         snprintf(formatted_message, sizeof(formatted_message), "[UNKNOWN] [%s] %s",
                  timestamp[0] ? timestamp : "", content);
@@ -179,6 +268,7 @@ void process_message(const char *message_str) {
 
 // Receive messages from server thread
 void* receive_messages(void *arg) {
+    (void)arg; // Suppress unused parameter warning
     char buffer[BUFFER_SIZE];
     char message_buffer[BUFFER_SIZE * 2] = {0};
 
@@ -307,6 +397,96 @@ void handle_input(void) {
             break;
         }
         
+        // Handle /sendfile command locally for validation and upload
+        if (strncmp(input, "/sendfile ", 10) == 0) {
+            char *cmd_copy = strdup(input);
+            strtok(cmd_copy, " "); // Skip the command token
+            char *filename = strtok(NULL, " ");
+            char *username = strtok(NULL, " ");
+            
+            if (!filename || !username) {
+                print_colored("[ERROR] Usage: /sendfile <filename> <username>", COLOR_RED);
+                free(cmd_copy);
+                continue;
+            }
+            
+            if (!validate_file(filename)) {
+                int file_size = get_file_size(filename);
+                if (file_size < 0) {
+                    print_colored("[ERROR] File not found or cannot be accessed", COLOR_RED);
+                } else if (file_size > MAX_FILE_SIZE) {
+                    char error_msg[256];
+                    snprintf(error_msg, sizeof(error_msg), 
+                        "[ERROR] File too large (%.1f MB). Max size: 3MB", 
+                        (float)file_size / (1024 * 1024));
+                    print_colored(error_msg, COLOR_RED);
+                } else {
+                    print_colored("[ERROR] Invalid file type. Allowed: .txt, .pdf, .jpg, .png", COLOR_RED);
+                }
+                free(cmd_copy);
+                continue;
+            }
+            
+            // File is valid, prepare for upload
+            int file_size = get_file_size(filename);
+            char confirm_msg[256];
+            snprintf(confirm_msg, sizeof(confirm_msg), 
+                "[INFO] Sending file '%s' (%.1f KB) to %s...", 
+                filename, (float)file_size / 1024, username);
+            print_colored(confirm_msg, COLOR_CYAN);
+            
+            // Create the complete sendfile command with embedded file size
+            char sendfile_cmd[BUFFER_SIZE];
+            snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s %d", filename, username, file_size);
+            
+            // Send command with file size to server
+            if (send(client.socket, sendfile_cmd, strlen(sendfile_cmd), 0) < 0) {
+                print_colored("[ERROR] Failed to send command to server", COLOR_RED);
+                free(cmd_copy);
+                continue;
+            }
+            
+            // Small delay to let server process the command
+            usleep(100000); // 100ms
+            
+            // Send file data immediately
+            FILE *file = fopen(filename, "rb");
+            if (!file) {
+                print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
+                free(cmd_copy);
+                continue;
+            }
+            
+            char file_buffer[8192];
+            size_t bytes_sent = 0;
+            size_t bytes_read;
+            
+            print_colored("[INFO] Uploading file data...", COLOR_CYAN);
+            
+            // Send file data in chunks
+            while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
+                if (send(client.socket, file_buffer, bytes_read, 0) < 0) {
+                    print_colored("[ERROR] Failed to send file data", COLOR_RED);
+                    break;
+                }
+                bytes_sent += bytes_read;
+            }
+            
+            fclose(file);
+            
+            if (bytes_sent == (size_t)file_size) {
+                char success_msg[256];
+                snprintf(success_msg, sizeof(success_msg), 
+                    "[INFO] File uploaded successfully (%zu bytes). Waiting for server confirmation...", bytes_sent);
+                print_colored(success_msg, COLOR_GREEN);
+            } else {
+                print_colored("[ERROR] File upload incomplete", COLOR_RED);
+            }
+            
+            free(cmd_copy);
+            continue;
+        }
+        
         // Send message to server
         if (send(client.socket, input, strlen(input), 0) < 0) {
             print_colored("Failed to send message", COLOR_RED);
@@ -330,6 +510,48 @@ void disconnect_from_server(void) {
     }
     
     print_colored("Disconnected from server", COLOR_YELLOW);
+}
+
+// Validate file for sending (check extension and size)
+int validate_file(const char *filename) {
+    if (!filename || strlen(filename) == 0) {
+        return 0;
+    }
+    
+    // Check if file exists and get size
+    struct stat st;
+    if (stat(filename, &st) != 0) {
+        return 0; // File doesn't exist
+    }
+    
+    // Check file size (max 3MB)
+    if (st.st_size > MAX_FILE_SIZE) {
+        return 0;
+    }
+    
+    // Check file extension
+    const char *ext = strrchr(filename, '.');
+    if (!ext) {
+        return 0; // No extension
+    }
+    
+    if (strcmp(ext, ".txt") == 0 || 
+        strcmp(ext, ".pdf") == 0 || 
+        strcmp(ext, ".jpg") == 0 || 
+        strcmp(ext, ".png") == 0) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+// Get file size in bytes
+int get_file_size(const char *filename) {
+    struct stat st;
+    if (stat(filename, &st) == 0) {
+        return st.st_size;
+    }
+    return -1;
 }
 
 int main(int argc, char *argv[]) {
