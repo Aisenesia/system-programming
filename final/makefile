@@ -1,10 +1,12 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -Iinclude
-SRC = src
+SRC_SERVER = server
+SRC_CLIENT = client
+
 OBJ = obj
 
-SRCS_SERVER = $(SRC)/gserver.c
-SRCS_CLIENT = $(SRC)/gclient.c
+SRCS_SERVER = $(SRC_SERVER)/gserver.c
+SRCS_CLIENT = $(SRC_CLIENT)/gclient.c
 
 OBJS_SERVER = $(SRCS_SERVER:.c=.o)
 OBJS_CLIENT = $(SRCS_CLIENT:.c=.o)
@@ -12,15 +14,17 @@ OBJS_CLIENT = $(SRCS_CLIENT:.c=.o)
 all: server client
 
 server: $(OBJS_SERVER)
-	$(CC) $(CFLAGS) -o gserver $(SRCS_SERVER)
+	$(CC) $(CFLAGS) -o chatserver $(SRCS_SERVER)
 
 client: $(OBJS_CLIENT)
-	$(CC) $(CFLAGS) -o gclient $(SRCS_CLIENT)
+	$(CC) $(CFLAGS) -o chatclient $(SRCS_CLIENT)
 
 
 
 clean:
-	rm -f gserver gclient
-	rm -f $(SRC)/*.o
+	rm -f chatserver chatclient
+	rm -f $(SRC_SERVER)/*.o
+	rm -f $(SRC_CLIENT)/*.o
+
 
 .PHONY: all clean

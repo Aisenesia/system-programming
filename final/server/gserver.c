@@ -1,19 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
-#include <ctype.h>
 #include <stdarg.h>
-#include <errno.h>
+#include <string.h>
+#include <unistd.h>
 #include <semaphore.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <ctype.h>
 
 #define MAX_CLIENTS 15
 #define MAX_ROOMS 50
@@ -23,7 +21,7 @@
 #define BUFFER_SIZE 2048
 #define MAX_UPLOAD_QUEUE 5
 #define MAX_FILE_SIZE (3 * 1024 * 1024) // 3MB
-#define FILES_DIR "files"
+#define FILES_DIR "files" // server temporariy holds the files in this directory
 
 // TODO: if no recipient is offline or not found, wrong command messages appear
 // TODO: if a recipient is not in a room or in a different one, it still sends the file to the recipient succesfully instead of returning an error

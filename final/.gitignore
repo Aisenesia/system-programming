@@ -1,7 +1,7 @@
 text.txt
 logs/*
 files/*
-gserver
-gclient
+chatserver
+chatclient
 server_log_*
 test
