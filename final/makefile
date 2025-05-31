@@ -26,5 +26,9 @@ clean:
 	rm -f $(SRC_SERVER)/*.o
 	rm -f $(SRC_CLIENT)/*.o
 
+copy:
+	cp chatclient test/al/
+	cp chatclient test/bob/
+
 
 .PHONY: all clean

@@ -70,6 +70,7 @@ void signal_handler(int sig) {
 // Print text with color
 void print_colored(const char *text, const char *color) {
     printf("%s%s%s\n", color, text, COLOR_RESET);
+    fflush(stdout); // Fix buffering issue
 }
 
 // Show help message
@@ -260,6 +261,47 @@ void process_message(const char *message_str) {
         snprintf(formatted_message, sizeof(formatted_message), "[SUCCESS] [%s] %s",
                  timestamp[0] ? timestamp : "", content);
         print_colored(formatted_message, COLOR_GREEN);
+    } else if (strcmp(type, "filename_proposal") == 0) {
+        // Handle filename proposal from server - automatically check file existence
+        char proposed_filename[256] = {0}, sender[64] = {0};
+        size_t file_size = 0;
+        
+        // Parse content: "FILENAME_PROPOSAL:filename:sender:size"
+        if (sscanf(content, "FILENAME_PROPOSAL:%255[^:]:%63[^:]:%zu", proposed_filename, sender, &file_size) == 3) {
+            snprintf(formatted_message, sizeof(formatted_message), 
+                     "[FILE PROPOSAL] %s wants to send '%s' (%.1f KB)", 
+                     sender, proposed_filename, (float)file_size / 1024);
+            print_colored(formatted_message, COLOR_CYAN);
+            fflush(stdout); // Fix buffering issue
+            
+            // Automatically check if file already exists locally
+            struct stat st;
+            int file_exists = (stat(proposed_filename, &st) == 0);
+            
+            if (file_exists) {
+                char conflict_msg[512];
+                snprintf(conflict_msg, sizeof(conflict_msg), 
+                         "[WARNING] File '%s' already exists locally (%.1f KB) - requesting rename", 
+                         proposed_filename, (float)st.st_size / 1024);
+                print_colored(conflict_msg, COLOR_YELLOW);
+                fflush(stdout);
+                
+                // Automatically request filename change to avoid overwriting
+                send(client.socket, "FILENAME_NOT", 12, 0);
+                print_colored("[INFO] Filename will be automatically renamed by server", COLOR_CYAN);
+                fflush(stdout);
+            } else {
+                // File doesn't exist, accept original filename
+                send(client.socket, "FILENAME_OK", 11, 0);
+                print_colored("[INFO] Filename accepted. Preparing to receive file...", COLOR_GREEN);
+                fflush(stdout);
+            }
+        } else {
+            print_colored("[ERROR] Invalid filename proposal message", COLOR_RED);
+            fflush(stdout);
+            // Send OK as fallback
+            send(client.socket, "FILENAME_OK", 11, 0);
+        }
     } else {
         snprintf(formatted_message, sizeof(formatted_message), "[UNKNOWN] [%s] %s",
                  timestamp[0] ? timestamp : "", content);

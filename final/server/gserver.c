@@ -508,6 +508,13 @@ void handle_sendfile_command(client_t *client, const char *filename, const char 
         return;
     }
 
+    // Check if user is trying to send file to themselves
+    if (strcmp(client->username, target_user) == 0) {
+        send_json_message(client->socket, "error", 
+            "You cannot send a file to yourself", "error");
+        return;
+    }
+
     if (!validate_filename(filename)) {
         send_json_message(client->socket, "error", 
             "Invalid filename! Must be max 255 characters, alphanumeric, '.', '_', or '-'.", "error");
@@ -550,7 +557,7 @@ void handle_sendfile_command(client_t *client, const char *filename, const char 
         }
     }
 
-    // Create temporary file path
+    // Create temporary file path - keep original name for temp storage
     char temp_path[512];
     const char *filename_only = strrchr(filename, '/');
     if (filename_only) {
@@ -558,7 +565,9 @@ void handle_sendfile_command(client_t *client, const char *filename, const char 
     } else {
         filename_only = filename;
     }
-    snprintf(temp_path, sizeof(temp_path), "files/%s_%s_%ld", client->username, filename_only, time(NULL));
+    
+    // Use a simple temp naming scheme without timestamp
+    snprintf(temp_path, sizeof(temp_path), "files/temp_%s_%s", client->username, filename_only);
 
     // Notify client to start sending file data
     send_json_message(client->socket, "success", "Ready to receive file data", "success");
@@ -812,12 +821,27 @@ void* process_file_transfers(void *arg) {
             continue;
         }
 
-        // Extract original filename for transfer
-        const char *filename_only = strrchr(transfer.filename, '/');
-        if (filename_only) {
-            filename_only++; // Skip the '/'
+        // Extract original filename for transfer (remove temp_ prefix and username)
+        const char *temp_filename_only = strrchr(transfer.filename, '/');
+        if (temp_filename_only) {
+            temp_filename_only++; // Skip the '/'
         } else {
-            filename_only = transfer.filename;
+            temp_filename_only = transfer.filename;
+        }
+        
+        // NEW: Extract original filename by removing temp prefix and username
+        char original_filename[256];
+        if (strncmp(temp_filename_only, "temp_", 5) == 0) {
+            // Find the second underscore to skip "temp_username_"
+            const char *after_temp = temp_filename_only + 5; // Skip "temp_"
+            const char *second_underscore = strchr(after_temp, '_');
+            if (second_underscore) {
+                strcpy(original_filename, second_underscore + 1); // Skip the username and underscore
+            } else {
+                strcpy(original_filename, temp_filename_only); // Fallback
+            }
+        } else {
+            strcpy(original_filename, temp_filename_only);
         }
 
         // NEW: Calculate and log queue wait duration
@@ -826,7 +850,7 @@ void* process_file_transfers(void *arg) {
         
         if (wait_duration > 1.0) {  // Only log if waited more than 1 second
             log_message("[FILE] '%s' from user '%s' started upload after %.0f seconds in queue", 
-                       filename_only, transfer.sender, wait_duration);
+                       original_filename, transfer.sender, wait_duration);
             
             // Notify sender about wait time
             pthread_mutex_lock(&server.clients_mutex);
@@ -835,15 +859,76 @@ void* process_file_transfers(void *arg) {
                 char wait_msg[256];
                 snprintf(wait_msg, sizeof(wait_msg), 
                         "File '%s' processed after %.0f seconds in queue", 
-                        filename_only, wait_duration);
+                        original_filename, wait_duration);
                 send_json_message(sender->socket, "system", wait_msg, "success");
             }
             pthread_mutex_unlock(&server.clients_mutex);
         }
 
-        // Use original filename - no preemptive renaming
+        // FIXED: Use original filename in handshake proposal
+        char potential_filename[512];
+        snprintf(potential_filename, sizeof(potential_filename), "%s", original_filename);
+        
+        // NEW: Implement filename handshake with client
         char final_filename[512];
-        strcpy(final_filename, filename_only);
+        
+        // Step 1: Propose original filename to client and wait for response
+        char filename_proposal[BUFFER_SIZE];
+        snprintf(filename_proposal, sizeof(filename_proposal), 
+                 "FILENAME_PROPOSAL:%s:%s:%zu", 
+                 potential_filename, transfer.sender, transfer.file_size);
+        send_json_message(receiver->socket, "filename_proposal", filename_proposal, "success");
+        
+        log_message("[FILE] Proposing filename '%s' to %s", potential_filename, transfer.receiver);
+        
+        // Wait for client response (OK or NOT)
+        char response_buffer[256];
+        int response_received = recv(receiver->socket, response_buffer, sizeof(response_buffer) - 1, 0);
+        if (response_received <= 0) {
+            log_message("[FILE ERROR] No response from client %s for filename proposal", transfer.receiver);
+            send_json_message(receiver->socket, "error", "File transfer failed - no response", "error");
+            
+            // Clean up temporary file
+            if (strstr(transfer.filename, "temp_") == transfer.filename) {
+                unlink(transfer.filename);
+                log_message("[FILE CLEANUP] Removed temporary file (no response): %s", transfer.filename);
+            }
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
+        
+        response_buffer[response_received] = '\0';
+        
+        // Parse client response
+        if (strncmp(response_buffer, "FILENAME_OK", 11) == 0) {
+            // Client accepts original filename
+            strcpy(final_filename, potential_filename);
+            log_message("[FILE] Client %s accepted filename '%s'", transfer.receiver, final_filename);
+        } else if (strncmp(response_buffer, "FILENAME_NOT", 12) == 0) {
+            // Client requests filename change - generate alternative
+            char base_name[256];
+            char extension[64] = "";
+            
+            // Extract base name and extension
+            strcpy(base_name, potential_filename);
+            char *ext_pos = strrchr(base_name, '.');
+            if (ext_pos) {
+                strcpy(extension, ext_pos);
+                *ext_pos = '\0';
+            }
+            
+            // Generate timestamped filename
+            time_t now = time(NULL);
+            snprintf(final_filename, sizeof(final_filename), "%s_%ld%s", base_name, now, extension);
+            log_message("[FILE] Client %s requested rename: '%s' → '%s'", 
+                       transfer.receiver, potential_filename, final_filename);
+        } else {
+            // Invalid response, default to original filename
+            strcpy(final_filename, potential_filename);
+            log_message("[FILE WARNING] Invalid response from %s, using original filename '%s'", 
+                       transfer.receiver, final_filename);
+        }
 
         // Step 1: Send file transfer initiation to recipient with resolved filename
         char file_header[BUFFER_SIZE];
@@ -883,11 +968,11 @@ void* process_file_transfers(void *arg) {
         // Step 3: Send completion notification
         if (bytes_sent == transfer.file_size) {
             log_message("[FILE SUCCESS] File %s (%zu bytes) sent directly to %s", 
-                        filename_only, bytes_sent, transfer.receiver);
+                        original_filename, bytes_sent, transfer.receiver);
             
             char completion_msg[BUFFER_SIZE];
             snprintf(completion_msg, sizeof(completion_msg), 
-                     "FILE_TRANSFER_END:%s:%zu", filename_only, bytes_sent);
+                     "FILE_TRANSFER_END:%s:%zu", original_filename, bytes_sent);
             send_json_message(receiver->socket, "file_transfer_end", completion_msg, "success");
             
             // Clean up temporary file and user temp directory
@@ -917,7 +1002,7 @@ void* process_file_transfers(void *arg) {
             if (sender) {
                 char success_msg[512];
                 snprintf(success_msg, sizeof(success_msg), 
-                         "File '%s' successfully sent to %s", filename_only, transfer.receiver);
+                         "File '%s' successfully sent to %s", original_filename, transfer.receiver);
                 send_json_message(sender->socket, "file_complete", success_msg, "success");
             }
         } else {
