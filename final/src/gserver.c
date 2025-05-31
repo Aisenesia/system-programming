@@ -228,7 +228,7 @@ int validate_filename(const char *filename) {
 
 // Ensure proper JSON formatting and escaping
 void send_json_message(int socket, const char *type, const char *content, const char *status) {
-    char json_message[BUFFER_SIZE];
+    char json_message[BUFFER_SIZE + 128]; // Extra space for escaping and formatting
     time_t now;
     struct tm *timeinfo;
     char timestamp[32];
@@ -705,7 +705,7 @@ void handle_sendfile_command_with_size(client_t *client, const char *filename, c
     }
 
     // Create temporary file path with original filename preserved
-    char temp_path[512];
+    char temp_path[768];
     snprintf(temp_path, sizeof(temp_path), "%s/%s", user_temp_dir, original_filename);
 
     // Confirm ready to receive file data

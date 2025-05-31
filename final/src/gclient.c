@@ -103,7 +103,7 @@ void process_message(const char *message_str) {
     if (start) {
         start += strlen(type_key);
         end = strchr(start, '"');
-        if (end && (end - start) < sizeof(type))
+        if (end && (end - start) < (int) sizeof(type))
             strncpy(type, start, end - start);
     }
 
@@ -112,7 +112,7 @@ void process_message(const char *message_str) {
     if (start) {
         start += strlen(content_key);
         end = strchr(start, '"');
-        if (end && (end - start) < sizeof(content))
+        if (end && (end - start) < (int) sizeof(content))
             strncpy(content, start, end - start);
     }
 
@@ -121,7 +121,7 @@ void process_message(const char *message_str) {
     if (start) {
         start += strlen(status_key);
         end = strchr(start, '"');
-        if (end && (end - start) < sizeof(status))
+        if (end && (end - start) < (int) sizeof(status))
             strncpy(status, start, end - start);
     }
 
@@ -130,7 +130,7 @@ void process_message(const char *message_str) {
     if (start) {
         start += strlen(timestamp_key);
         end = strchr(start, '"');
-        if (end && (end - start) < sizeof(timestamp))
+        if (end && (end - start) < (int) sizeof(timestamp))
             strncpy(timestamp, start, end - start);
     }
 
