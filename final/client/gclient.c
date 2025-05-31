@@ -27,7 +27,7 @@
 #define COLOR_RESET   "\033[0m"
 #define COLOR_DEBUG   "\033[90m"
 
-#define DEBUG 1
+#define DEBUG 0
 
 #if DEBUG
 #define debug_print(fmt, ...) printf(COLOR_DEBUG fmt COLOR_RESET, ##__VA_ARGS__)
@@ -410,36 +410,26 @@ void handle_input(void) {
                 continue;
             }
             
-            if (!validate_file(filename)) {
-                int file_size = get_file_size(filename);
-                if (file_size < 0) {
-                    print_colored("[ERROR] File not found or cannot be accessed", COLOR_RED);
-                } else if (file_size > MAX_FILE_SIZE) {
-                    char error_msg[256];
-                    snprintf(error_msg, sizeof(error_msg), 
-                        "[ERROR] File too large (%.1f MB). Max size: 3MB", 
-                        (float)file_size / (1024 * 1024));
-                    print_colored(error_msg, COLOR_RED);
-                } else {
-                    print_colored("[ERROR] Invalid file type. Allowed: .txt, .pdf, .jpg, .png", COLOR_RED);
-                }
+            // Get file size without validation
+            int file_size = get_file_size(filename);
+            if (file_size < 0) {
+                print_colored("[ERROR] File not found or cannot be accessed", COLOR_RED);
                 free(cmd_copy);
                 continue;
             }
             
-            // File is valid, prepare for upload
-            int file_size = get_file_size(filename);
+            // File exists, prepare for upload (no size or type validation)
             char confirm_msg[256];
             snprintf(confirm_msg, sizeof(confirm_msg), 
                 "[INFO] Sending file '%s' (%.1f KB) to %s...", 
                 filename, (float)file_size / 1024, username);
             print_colored(confirm_msg, COLOR_CYAN);
             
-            // Create the complete sendfile command with embedded file size
+            // Create the complete sendfile command
             char sendfile_cmd[BUFFER_SIZE];
-            snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s %d", filename, username, file_size);
+            snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s", filename, username);
             
-            // Send command with file size to server
+            // Send command to server
             if (send(client.socket, sendfile_cmd, strlen(sendfile_cmd), 0) < 0) {
                 print_colored("[ERROR] Failed to send command to server", COLOR_RED);
                 free(cmd_copy);
@@ -449,7 +439,19 @@ void handle_input(void) {
             // Small delay to let server process the command
             usleep(100000); // 100ms
             
-            // Send file data immediately
+            // Send file size when requested by server
+            char size_buffer[64];
+            snprintf(size_buffer, sizeof(size_buffer), "%d", file_size);
+            if (send(client.socket, size_buffer, strlen(size_buffer), 0) < 0) {
+                print_colored("[ERROR] Failed to send file size to server", COLOR_RED);
+                free(cmd_copy);
+                continue;
+            }
+            
+            // Small delay
+            usleep(100000); // 100ms
+            
+            // Send file data
             FILE *file = fopen(filename, "rb");
             if (!file) {
                 print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
