@@ -43,6 +43,19 @@ typedef struct {
 
 client_t client = {0};
 
+// Global flag to track file sending state
+static volatile int waiting_for_file_ready = 0;
+static char pending_filename[256] = {0};
+static char pending_username[64] = {0};
+static int pending_file_size = 0;
+
+// Global flag to track file receiving state
+static volatile int receiving_file = 0;
+static FILE *receiving_file_handle = NULL;
+static size_t expected_file_size = 0;
+static size_t bytes_received_so_far = 0;
+static char receiving_filename[256] = {0};
+
 // Function prototypes
 void signal_handler(int sig);
 void print_colored(const char *text, const char *color);
@@ -156,9 +169,52 @@ void process_message(const char *message_str) {
         snprintf(formatted_message, sizeof(formatted_message), "[SYSTEM] %s", content);
         print_colored(formatted_message, COLOR_CYAN);
     } else if (strcmp(type, "success") == 0) {
+        // Check if this is the "Ready to receive file data" message
+        if (waiting_for_file_ready && strstr(content, "Ready to receive file data") != NULL) {
+            print_colored("[SUCCESS] Ready to receive file data", COLOR_GREEN);
+            print_colored("[INFO] Uploading file data...", COLOR_CYAN);
+            
+            // Send file data
+            FILE *file = fopen(pending_filename, "rb");
+            if (!file) {
+                print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
+                waiting_for_file_ready = 0;
+                return;
+            }
+            
+            char file_buffer[8192];
+            size_t bytes_sent = 0;
+            size_t bytes_read;
+            
+            // Send file data in chunks
+            while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
+                if (send(client.socket, file_buffer, bytes_read, 0) < 0) {
+                    print_colored("[ERROR] Failed to send file data", COLOR_RED);
+                    break;
+                }
+                bytes_sent += bytes_read;
+            }
+            
+            fclose(file);
+            
+            if (bytes_sent == (size_t)pending_file_size) {
+                print_colored("[INFO] File upload completed. Processing...", COLOR_GREEN);
+            } else {
+                print_colored("[ERROR] File upload incomplete", COLOR_RED);
+            }
+            
+            waiting_for_file_ready = 0;
+            return;
+        }
+        
         snprintf(formatted_message, sizeof(formatted_message), "[SUCCESS] %s", content);
         print_colored(formatted_message, COLOR_GREEN);
     } else if (strcmp(type, "error") == 0) {
+        // If we were waiting for file ready and got an error, reset the flag
+        if (waiting_for_file_ready) {
+            waiting_for_file_ready = 0;
+        }
+        
         snprintf(formatted_message, sizeof(formatted_message), "[ERROR] %s", content);
         print_colored(formatted_message, COLOR_RED);
     } else if (strcmp(type, "broadcast") == 0) {
@@ -194,53 +250,21 @@ void process_message(const char *message_str) {
                      filename, sender, (float)file_size / 1024);
             print_colored(formatted_message, COLOR_CYAN);
             
-            // Prepare to receive file data
-            FILE *file = fopen(filename, "wb");
-            if (!file) {
+            // Set up state for file receiving in the receive_messages thread
+            receiving_file = 1;
+            expected_file_size = file_size;
+            bytes_received_so_far = 0;
+            strncpy(receiving_filename, filename, sizeof(receiving_filename) - 1);
+            
+            // Open file for writing
+            receiving_file_handle = fopen(filename, "wb");
+            if (!receiving_file_handle) {
                 print_colored("[ERROR] Cannot create file for writing", COLOR_RED);
+                receiving_file = 0;
                 return;
             }
             
-            char file_buffer[8192];
-            size_t bytes_received = 0;
-            size_t bytes_to_read;
-            
             print_colored("[INFO] Receiving file data...", COLOR_CYAN);
-            
-            // Receive file data in chunks
-            while (bytes_received < file_size) {
-                bytes_to_read = (file_size - bytes_received > sizeof(file_buffer)) ? 
-                               sizeof(file_buffer) : (file_size - bytes_received);
-                
-                int received = recv(client.socket, file_buffer, bytes_to_read, 0);
-                if (received <= 0) {
-                    print_colored("[ERROR] Connection lost during file transfer", COLOR_RED);
-                    fclose(file);
-                    unlink(filename); // Remove incomplete file
-                    return;
-                }
-                
-                if (fwrite(file_buffer, 1, received, file) != (size_t)received) {
-                    print_colored("[ERROR] Failed to write file data", COLOR_RED);
-                    fclose(file);
-                    unlink(filename); // Remove incomplete file
-                    return;
-                }
-                
-                bytes_received += received;
-            }
-            
-            fclose(file);
-            
-            if (bytes_received == file_size) {
-                snprintf(formatted_message, sizeof(formatted_message), 
-                         "[FILE SUCCESS] File '%s' received from %s (%.1f KB) - saved locally", 
-                         filename, sender, (float)bytes_received / 1024);
-                print_colored(formatted_message, COLOR_GREEN);
-            } else {
-                print_colored("[ERROR] File transfer incomplete", COLOR_RED);
-                unlink(filename); // Remove incomplete file
-            }
         } else {
             print_colored("[ERROR] Invalid file transfer start message", COLOR_RED);
         }
@@ -350,6 +374,50 @@ void* receive_messages(void *arg) {
                 break;
             }
 
+            // Check if we're in file receiving mode
+            if (receiving_file && receiving_file_handle) {
+                // Handle file data reception
+                size_t bytes_to_write = bytes_received;
+                size_t remaining_file_bytes = expected_file_size - bytes_received_so_far;
+                
+                if (bytes_to_write > remaining_file_bytes) {
+                    bytes_to_write = remaining_file_bytes;
+                }
+                
+                if (fwrite(buffer, 1, bytes_to_write, receiving_file_handle) != bytes_to_write) {
+                    print_colored("[ERROR] Failed to write file data", COLOR_RED);
+                    fclose(receiving_file_handle);
+                    receiving_file_handle = NULL;
+                    receiving_file = 0;
+                    unlink(receiving_filename);
+                    continue;
+                }
+                
+                bytes_received_so_far += bytes_to_write;
+                
+                // Check if file transfer is complete
+                if (bytes_received_so_far >= expected_file_size) {
+                    fclose(receiving_file_handle);
+                    receiving_file_handle = NULL;
+                    receiving_file = 0;
+                    
+                    char success_msg[512];
+                    snprintf(success_msg, sizeof(success_msg),
+                             "[FILE SUCCESS] File '%s' received (%.1f KB) - saved locally",
+                             receiving_filename, (float)bytes_received_so_far / 1024);
+                    print_colored(success_msg, COLOR_GREEN);
+                }
+                
+                // If there's extra data beyond the file, process it as normal messages
+                if (bytes_received > (int)bytes_to_write) {
+                    buffer[bytes_received] = '\0';
+                    strcat(message_buffer, buffer + bytes_to_write);
+                }
+                
+                continue;
+            }
+            
+            // Normal message processing
             buffer[bytes_received] = '\0';
             strcat(message_buffer, buffer);
 
@@ -478,62 +546,19 @@ void handle_input(void) {
                 filename, (float)file_size / 1024, username);
             print_colored(confirm_msg, COLOR_CYAN);
             
+            // Set up state for async file sending
+            waiting_for_file_ready = 1;
+            strncpy(pending_filename, filename, sizeof(pending_filename) - 1);
+            strncpy(pending_username, username, sizeof(pending_username) - 1);
+            pending_file_size = file_size;
+            
             // Send command with file size to server
             char sendfile_cmd[BUFFER_SIZE];
             snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s %d", filename, username, file_size);
             
             if (send(client.socket, sendfile_cmd, strlen(sendfile_cmd), 0) < 0) {
                 print_colored("[ERROR] Failed to send command to server", COLOR_RED);
-                free(cmd_copy);
-                continue;
-            }
-            
-            // Wait for server response - either error or ready for file data
-            char response[BUFFER_SIZE];
-            int bytes_received = recv(client.socket, response, sizeof(response) - 1, 0);
-            if (bytes_received <= 0) {
-                print_colored("[ERROR] No response from server", COLOR_RED);
-                free(cmd_copy);
-                continue;
-            }
-            response[bytes_received] = '\0';
-            
-            // Check if server is ready for file data or gave an error
-            if (strstr(response, "Ready to receive file data") != NULL) {
-                print_colored("[INFO] Uploading file data...", COLOR_CYAN);
-                
-                // Send file data
-                FILE *file = fopen(filename, "rb");
-                if (!file) {
-                    print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
-                    free(cmd_copy);
-                    continue;
-                }
-                
-                char file_buffer[8192];
-                size_t bytes_sent = 0;
-                size_t bytes_read;
-                
-                // Send file data in chunks
-                while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
-                    if (send(client.socket, file_buffer, bytes_read, 0) < 0) {
-                        print_colored("[ERROR] Failed to send file data", COLOR_RED);
-                        break;
-                    }
-                    bytes_sent += bytes_read;
-                }
-                
-                fclose(file);
-                
-                if (bytes_sent == (size_t)file_size) {
-                    print_colored("[INFO] File upload completed. Processing...", COLOR_GREEN);
-                } else {
-                    print_colored("[ERROR] File upload incomplete", COLOR_RED);
-                }
-            } else {
-                // Server gave an error, the response should be processed by the message handler
-                // Let the normal message processing handle the error response
-                process_message(response);
+                waiting_for_file_ready = 0;
             }
             
             free(cmd_copy);
