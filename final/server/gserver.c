@@ -836,7 +836,6 @@ void* process_file_transfers(void *arg) {
         
         // Store socket file descriptors while we have the lock
         int receiver_socket = receiver->socket;
-        int sender_socket = sender->socket;
         pthread_mutex_unlock(&server.clients_mutex);
 
         // Check if the file still exists before processing
