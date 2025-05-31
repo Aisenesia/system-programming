@@ -102,7 +102,7 @@ void handle_join_command(client_t *client, const char *room_name);
 void handle_leave_command(client_t *client);
 void handle_broadcast_command(client_t *client, const char *message);
 void handle_whisper_command(client_t *client, const char *target_user, const char *message);
-void handle_sendfile_command(client_t *client, const char *filename, const char *target_user);
+void handle_sendfile_command(client_t *client, const char *filename, const char *target_user, const char *file_size_str);
 void init_upload_queue(void);
 void destroy_upload_queue(void);
 int enqueue_file_transfer(const char *filename, const char *sender, const char *receiver, size_t file_size);
@@ -500,8 +500,8 @@ void handle_whisper_command(client_t *client, const char *target_user, const cha
     log_message("[WHISPER] '%s' to '%s': %s", client->username, target_user, message);
 }
 
-// Handle file sending - Updated to handle complete client-to-client file transfer
-void handle_sendfile_command(client_t *client, const char *filename, const char *target_user) {
+// Handle file sending - Updated to accept file size with initial command
+void handle_sendfile_command(client_t *client, const char *filename, const char *target_user, const char *file_size_str) {
     if (strlen(client->room_name) == 0) {
         send_json_message(client->socket, "error", 
             "You must join a room first to send files", "error");
@@ -524,19 +524,8 @@ void handle_sendfile_command(client_t *client, const char *filename, const char 
         return;
     }
 
-    // Request file size from client first
-    send_json_message(client->socket, "system", "Please send file size", "success");
-    
-    // Receive file size
-    char buffer[64];
-    int bytes_received = recv(client->socket, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received <= 0) {
-        send_json_message(client->socket, "error", "Failed to receive file size", "error");
-        return;
-    }
-    buffer[bytes_received] = '\0';
-    
-    size_t file_size = atoi(buffer);
+    // Parse file size from the command
+    size_t file_size = atoi(file_size_str);
     if (file_size <= 0 || file_size > MAX_FILE_SIZE) {
         send_json_message(client->socket, "error", 
             "Invalid file size (max 3MB)", "error");
@@ -852,13 +841,9 @@ void* process_file_transfers(void *arg) {
             pthread_mutex_unlock(&server.clients_mutex);
         }
 
-        // NEW: Resolve filename collision for recipient
+        // Use original filename - no preemptive renaming
         char final_filename[512];
         strcpy(final_filename, filename_only);
-        
-        // Check for collision and resolve if needed
-        char *resolved_name = resolve_filename_collision(final_filename);
-        strcpy(final_filename, resolved_name);
 
         // Step 1: Send file transfer initiation to recipient with resolved filename
         char file_header[BUFFER_SIZE];
@@ -1029,12 +1014,13 @@ void handle_command(client_t *client, const char *command) {
     else if (strcmp(token, "/sendfile") == 0) {
         char *filename = strtok(NULL, " ");
         char *target_user = strtok(NULL, " ");
-        if (!filename || !target_user) {
-            send_json_message(client->socket, "error", "Usage: /sendfile <filename> <username>", "error");
+        char *file_size_str = strtok(NULL, " ");
+        if (!filename || !target_user || !file_size_str) {
+            send_json_message(client->socket, "error", "Usage: /sendfile <filename> <username> <file_size>", "error");
             return;
         }
         
-        handle_sendfile_command(client, filename, target_user);
+        handle_sendfile_command(client, filename, target_user, file_size_str);
     }
     // Update /exit command handling to clean up client resources immediately
     else if (strcmp(token, "/exit") == 0) {

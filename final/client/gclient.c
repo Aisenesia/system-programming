@@ -255,6 +255,11 @@ void process_message(const char *message_str) {
                      filename, (float)file_size / 1024);
             print_colored(formatted_message, COLOR_GREEN);
         }
+    } else if (strcmp(type, "file_complete") == 0) {
+        // Handle successful file upload notification
+        snprintf(formatted_message, sizeof(formatted_message), "[SUCCESS] [%s] %s",
+                 timestamp[0] ? timestamp : "", content);
+        print_colored(formatted_message, COLOR_GREEN);
     } else {
         snprintf(formatted_message, sizeof(formatted_message), "[UNKNOWN] [%s] %s",
                  timestamp[0] ? timestamp : "", content);
@@ -410,7 +415,7 @@ void handle_input(void) {
                 continue;
             }
             
-            // Get file size without validation
+            // Validate file exists and get size
             int file_size = get_file_size(filename);
             if (file_size < 0) {
                 print_colored("[ERROR] File not found or cannot be accessed", COLOR_RED);
@@ -418,71 +423,75 @@ void handle_input(void) {
                 continue;
             }
             
-            // File exists, prepare for upload (no size or type validation)
+            // Validate file type and size
+            if (!validate_file(filename)) {
+                print_colored("[ERROR] Invalid file type or size. Allowed: .txt, .pdf, .jpg, .png (max 3MB)", COLOR_RED);
+                free(cmd_copy);
+                continue;
+            }
+            
             char confirm_msg[256];
             snprintf(confirm_msg, sizeof(confirm_msg), 
                 "[INFO] Sending file '%s' (%.1f KB) to %s...", 
                 filename, (float)file_size / 1024, username);
             print_colored(confirm_msg, COLOR_CYAN);
             
-            // Create the complete sendfile command
+            // Send command with file size to server
             char sendfile_cmd[BUFFER_SIZE];
-            snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s", filename, username);
+            snprintf(sendfile_cmd, sizeof(sendfile_cmd), "/sendfile %s %s %d", filename, username, file_size);
             
-            // Send command to server
             if (send(client.socket, sendfile_cmd, strlen(sendfile_cmd), 0) < 0) {
                 print_colored("[ERROR] Failed to send command to server", COLOR_RED);
                 free(cmd_copy);
                 continue;
             }
             
-            // Small delay to let server process the command
-            usleep(100000); // 100ms
-            
-            // Send file size when requested by server
-            char size_buffer[64];
-            snprintf(size_buffer, sizeof(size_buffer), "%d", file_size);
-            if (send(client.socket, size_buffer, strlen(size_buffer), 0) < 0) {
-                print_colored("[ERROR] Failed to send file size to server", COLOR_RED);
+            // Wait for server response - either error or ready for file data
+            char response[BUFFER_SIZE];
+            int bytes_received = recv(client.socket, response, sizeof(response) - 1, 0);
+            if (bytes_received <= 0) {
+                print_colored("[ERROR] No response from server", COLOR_RED);
                 free(cmd_copy);
                 continue;
             }
+            response[bytes_received] = '\0';
             
-            // Small delay
-            usleep(100000); // 100ms
-            
-            // Send file data
-            FILE *file = fopen(filename, "rb");
-            if (!file) {
-                print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
-                free(cmd_copy);
-                continue;
-            }
-            
-            char file_buffer[8192];
-            size_t bytes_sent = 0;
-            size_t bytes_read;
-            
-            print_colored("[INFO] Uploading file data...", COLOR_CYAN);
-            
-            // Send file data in chunks
-            while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
-                if (send(client.socket, file_buffer, bytes_read, 0) < 0) {
-                    print_colored("[ERROR] Failed to send file data", COLOR_RED);
-                    break;
+            // Check if server is ready for file data or gave an error
+            if (strstr(response, "Ready to receive file data") != NULL) {
+                print_colored("[INFO] Uploading file data...", COLOR_CYAN);
+                
+                // Send file data
+                FILE *file = fopen(filename, "rb");
+                if (!file) {
+                    print_colored("[ERROR] Failed to open file for reading", COLOR_RED);
+                    free(cmd_copy);
+                    continue;
                 }
-                bytes_sent += bytes_read;
-            }
-            
-            fclose(file);
-            
-            if (bytes_sent == (size_t)file_size) {
-                char success_msg[256];
-                snprintf(success_msg, sizeof(success_msg), 
-                    "[INFO] File uploaded successfully (%zu bytes). Waiting for server confirmation...", bytes_sent);
-                print_colored(success_msg, COLOR_GREEN);
+                
+                char file_buffer[8192];
+                size_t bytes_sent = 0;
+                size_t bytes_read;
+                
+                // Send file data in chunks
+                while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
+                    if (send(client.socket, file_buffer, bytes_read, 0) < 0) {
+                        print_colored("[ERROR] Failed to send file data", COLOR_RED);
+                        break;
+                    }
+                    bytes_sent += bytes_read;
+                }
+                
+                fclose(file);
+                
+                if (bytes_sent == (size_t)file_size) {
+                    print_colored("[INFO] File upload completed. Processing...", COLOR_GREEN);
+                } else {
+                    print_colored("[ERROR] File upload incomplete", COLOR_RED);
+                }
             } else {
-                print_colored("[ERROR] File upload incomplete", COLOR_RED);
+                // Server gave an error, the response should be processed by the message handler
+                // Let the normal message processing handle the error response
+                process_message(response);
             }
             
             free(cmd_copy);
