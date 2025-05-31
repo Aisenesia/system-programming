@@ -99,7 +99,7 @@ class ChatClient:
         
         # Extract just the filename without the directory path for the command
         filename_only = os.path.basename(filename)
-        command = f"/sendfile {filename_only} {target_user}"
+        command = f"/sendfile {filename_only} {target_user} {file_size}"
         
         if not self._send_message(command):
             return False
@@ -107,14 +107,14 @@ class ChatClient:
         # Wait for server to process command and respond
         time.sleep(0.5)
         
-        # Check server response for file size request or error
-        file_size_requested = False
+        # Check server response for ready message or error
+        ready_to_send = False
         error_found = False
         
         for message in self.messages_received[-10:]:  # Check last 10 messages
             message_lower = message.lower()
-            if "please send file size" in message_lower or "send file size" in message_lower:
-                file_size_requested = True
+            if "ready to receive file data" in message_lower:
+                ready_to_send = True
                 break
             elif "error" in message_lower:
                 if any(keyword in message_lower for keyword in ["size", "3mb", "invalid", "room", "offline", "file type", "max"]):
@@ -125,37 +125,15 @@ class ChatClient:
         if error_found:
             return False  # Server rejected the file
         
-        if not file_size_requested:
-            print(f"✗ Client {self.client_id} no file size request from server after {len(self.messages_received)} messages")
+        if not ready_to_send:
+            print(f"✗ Client {self.client_id} server not ready to receive file data")
             # Print last few messages for debugging
             for msg in self.messages_received[-5:]:
                 print(f"   Last message: {msg}")
             return False
         
-        # Send file size as requested by server
+        # Send file data directly (no file size message needed)
         try:
-            size_message = str(file_size)
-            if not self._send_message(size_message):
-                print(f"✗ Client {self.client_id} failed to send file size")
-                return False
-            
-            # Wait for server confirmation to start sending file data
-            time.sleep(0.5)
-            
-            ready_to_send = False
-            for message in self.messages_received[-5:]:
-                if "ready to receive file data" in message.lower():
-                    ready_to_send = True
-                    break
-                elif "error" in message.lower():
-                    print(f"✗ Client {self.client_id} server error after size: {message}")
-                    return False
-            
-            if not ready_to_send:
-                print(f"✗ Client {self.client_id} server not ready to receive file data")
-                return False
-            
-            # Send file data (using the original full path to read the file)
             with open(filename, 'rb') as f:
                 total_sent = 0
                 while True:

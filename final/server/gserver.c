@@ -12,6 +12,9 @@
 #include <semaphore.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/select.h>
 
 #define MAX_CLIENTS 15
 #define MAX_ROOMS 50
@@ -51,7 +54,7 @@ typedef struct {
     size_t file_size;
     int in_progress;
     time_t timestamp;
-    time_t enqueue_time;  // NEW: Track when file was added to queue
+    time_t enqueue_time;  // Track when file was added to queue
 } file_transfer_t;
 
 // File upload queue
@@ -112,7 +115,12 @@ void cleanup_client(client_t *client);
 void* handle_client(void *arg);
 void start_server(int port);
 void shutdown_server(void);
-char* resolve_filename_collision(const char *original_filename);  // NEW: Handle filename collisions
+char* resolve_filename_collision(const char *original_filename);
+void cleanup_pending_files_for_user(const char *username);
+void cleanup_all_temporary_files(void);
+void cleanup_queue_on_shutdown(void);
+void cleanup_orphaned_files(void);
+void* periodic_cleanup_thread(void *arg);
 
 // Global shutdown flag
 static volatile int shutdown_requested = 0;
@@ -135,6 +143,9 @@ void signal_handler(int sig) {
             }
         }
         pthread_mutex_unlock(&server.clients_mutex);
+
+        // Clean up all pending file transfers and temporary files
+        cleanup_queue_on_shutdown();
 
         // Close server socket to break accept() loop
         if (server.server_socket > 0) {
@@ -502,12 +513,6 @@ void handle_whisper_command(client_t *client, const char *target_user, const cha
 
 // Handle file sending - Updated to accept file size with initial command
 void handle_sendfile_command(client_t *client, const char *filename, const char *target_user, const char *file_size_str) {
-    if (strlen(client->room_name) == 0) {
-        send_json_message(client->socket, "error", 
-            "You must join a room first to send files", "error");
-        return;
-    }
-
     // Check if user is trying to send file to themselves
     if (strcmp(client->username, target_user) == 0) {
         send_json_message(client->socket, "error", 
@@ -639,7 +644,7 @@ void handle_sendfile_command(client_t *client, const char *filename, const char 
     }
 }
 
-// NEW: Handle filename collisions by checking for existing files and renaming if necessary
+// Handle filename collisions by checking for existing files and renaming if necessary
 char* resolve_filename_collision(const char *original_filename) {
     static char resolved_filename[512];
     struct stat st;
@@ -699,12 +704,12 @@ void destroy_upload_queue(void) {
 
 // Enqueue a file transfer
 int enqueue_file_transfer(const char *filename, const char *sender, const char *receiver, size_t file_size) {
-    // NEW: Check current queue size before acquiring semaphore for feedback
+    // Check current queue size before acquiring semaphore for feedback
     pthread_mutex_lock(&server.upload_queue.mutex);
     int current_queue_size = server.upload_queue.count;
     pthread_mutex_unlock(&server.upload_queue.mutex);
     
-    // NEW: If queue is full, notify sender about queuing
+    // If queue is full, notify sender about queuing
     if (current_queue_size >= MAX_UPLOAD_QUEUE) {
         pthread_mutex_lock(&server.clients_mutex);
         client_t *sender_client = find_client_by_username(sender);
@@ -730,12 +735,12 @@ int enqueue_file_transfer(const char *filename, const char *sender, const char *
     transfer->file_size = file_size;
     transfer->in_progress = 1;
     transfer->timestamp = time(NULL);
-    transfer->enqueue_time = time(NULL);  // NEW: Set enqueue time
+    transfer->enqueue_time = time(NULL);  // Set enqueue time
 
     server.upload_queue.tail = (server.upload_queue.tail + 1) % MAX_UPLOAD_QUEUE;
     server.upload_queue.count++;
     
-    // NEW: Enhanced queue logging with current queue size
+    // Enhanced queue logging with current queue size
     const char *filename_only = strrchr(filename, '/');
     if (filename_only) {
         filename_only++; // Skip the '/'
@@ -781,41 +786,79 @@ void* process_file_transfers(void *arg) {
         log_message("[FILE] Processing transfer: %s (%zu bytes) from %s to %s", 
                     transfer.filename, transfer.file_size, transfer.sender, transfer.receiver);
 
-        // Find the recipient client
+        // Find the recipient client with thread safety
         pthread_mutex_lock(&server.clients_mutex);
         client_t *receiver = find_client_by_username(transfer.receiver);
-        pthread_mutex_unlock(&server.clients_mutex);
-
-        if (!receiver) {
+        client_t *sender = find_client_by_username(transfer.sender);
+        
+        // Check if both users are still connected
+        if (!receiver || !receiver->active) {
+            pthread_mutex_unlock(&server.clients_mutex);
             log_message("[FILE ERROR] Recipient %s not found or offline", transfer.receiver);
             
             // Clean up temporary file if recipient is offline
             if (strstr(transfer.filename, "temp_") == transfer.filename) {
                 unlink(transfer.filename);
                 log_message("[FILE CLEANUP] Removed temporary file (recipient offline): %s", transfer.filename);
-                
-                // Extract and try to remove user temp directory
-                char temp_filename[512];
-                strcpy(temp_filename, transfer.filename);
-                char *dir_end = strrchr(temp_filename, '/');
-                if (dir_end) {
-                    *dir_end = '\0';
-                    if (rmdir(temp_filename) == 0) {
-                        log_message("[FILE CLEANUP] Removed empty user temp directory: %s", temp_filename);
-                    }
-                }
             }
             
-            // Notify sender that recipient is offline
-            pthread_mutex_lock(&server.clients_mutex);
-            client_t *sender = find_client_by_username(transfer.sender);
-            pthread_mutex_unlock(&server.clients_mutex);
-            if (sender) {
+            // Notify sender that recipient is offline (only if sender is still connected)
+            if (sender && sender->active) {
                 char error_msg[512];
                 snprintf(error_msg, sizeof(error_msg), 
                          "File transfer failed: %s is offline", transfer.receiver);
                 send_json_message(sender->socket, "error", error_msg, "error");
             }
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
+        
+        if (!sender || !sender->active) {
+            pthread_mutex_unlock(&server.clients_mutex);
+            log_message("[FILE ERROR] Sender %s disconnected during transfer", transfer.sender);
+            
+            // Clean up temporary file if sender disconnected
+            if (strstr(transfer.filename, "temp_") == transfer.filename) {
+                unlink(transfer.filename);
+                log_message("[FILE CLEANUP] Removed temporary file (sender offline): %s", transfer.filename);
+            }
+            
+            // Notify receiver that sender is offline
+            char error_msg[512];
+            snprintf(error_msg, sizeof(error_msg), 
+                     "File transfer cancelled: %s has disconnected", transfer.sender);
+            send_json_message(receiver->socket, "error", error_msg, "error");
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
+        
+        // Store socket file descriptors while we have the lock
+        int receiver_socket = receiver->socket;
+        int sender_socket = sender->socket;
+        pthread_mutex_unlock(&server.clients_mutex);
+
+        // Check if the file still exists before processing
+        struct stat file_stat;
+        if (stat(transfer.filename, &file_stat) != 0) {
+            log_message("[FILE ERROR] Source file no longer exists: %s", transfer.filename);
+            
+            // Notify both users about the error
+            char error_msg[512];
+            snprintf(error_msg, sizeof(error_msg), "File transfer failed: source file missing");
+            
+            pthread_mutex_lock(&server.clients_mutex);
+            client_t *current_receiver = find_client_by_username(transfer.receiver);
+            client_t *current_sender = find_client_by_username(transfer.sender);
+            
+            if (current_receiver && current_receiver->active) {
+                send_json_message(current_receiver->socket, "error", error_msg, "error");
+            }
+            if (current_sender && current_sender->active) {
+                send_json_message(current_sender->socket, "error", error_msg, "error");
+            }
+            pthread_mutex_unlock(&server.clients_mutex);
             
             sem_post(&server.upload_queue.upload_slots);
             continue;
@@ -829,7 +872,7 @@ void* process_file_transfers(void *arg) {
             temp_filename_only = transfer.filename;
         }
         
-        // NEW: Extract original filename by removing temp prefix and username
+        // Extract original filename by removing temp prefix and username
         char original_filename[256];
         if (strncmp(temp_filename_only, "temp_", 5) == 0) {
             // Find the second underscore to skip "temp_username_"
@@ -844,32 +887,20 @@ void* process_file_transfers(void *arg) {
             strcpy(original_filename, temp_filename_only);
         }
 
-        // NEW: Calculate and log queue wait duration
+        // Calculate and log queue wait duration
         time_t current_time = time(NULL);
         double wait_duration = difftime(current_time, transfer.enqueue_time);
         
         if (wait_duration > 1.0) {  // Only log if waited more than 1 second
             log_message("[FILE] '%s' from user '%s' started upload after %.0f seconds in queue", 
                        original_filename, transfer.sender, wait_duration);
-            
-            // Notify sender about wait time
-            pthread_mutex_lock(&server.clients_mutex);
-            client_t *sender = find_client_by_username(transfer.sender);
-            if (sender) {
-                char wait_msg[256];
-                snprintf(wait_msg, sizeof(wait_msg), 
-                        "File '%s' processed after %.0f seconds in queue", 
-                        original_filename, wait_duration);
-                send_json_message(sender->socket, "system", wait_msg, "success");
-            }
-            pthread_mutex_unlock(&server.clients_mutex);
         }
 
-        // FIXED: Use original filename in handshake proposal
+        // Use original filename in handshake proposal
         char potential_filename[512];
         snprintf(potential_filename, sizeof(potential_filename), "%s", original_filename);
         
-        // NEW: Implement filename handshake with client
+        // Implement filename handshake with client
         char final_filename[512];
         
         // Step 1: Propose original filename to client and wait for response
@@ -877,16 +908,68 @@ void* process_file_transfers(void *arg) {
         snprintf(filename_proposal, sizeof(filename_proposal), 
                  "FILENAME_PROPOSAL:%s:%s:%zu", 
                  potential_filename, transfer.sender, transfer.file_size);
-        send_json_message(receiver->socket, "filename_proposal", filename_proposal, "success");
         
+        // Double-check receiver is still connected before sending proposal
+        pthread_mutex_lock(&server.clients_mutex);
+        client_t *current_receiver = find_client_by_username(transfer.receiver);
+        if (!current_receiver || !current_receiver->active) {
+            pthread_mutex_unlock(&server.clients_mutex);
+            log_message("[FILE ERROR] Receiver %s disconnected before filename proposal", transfer.receiver);
+            
+            // Clean up and notify sender
+            if (strstr(transfer.filename, "temp_") == transfer.filename) {
+                unlink(transfer.filename);
+                log_message("[FILE CLEANUP] Removed temporary file (receiver disconnected): %s", transfer.filename);
+            }
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
+        pthread_mutex_unlock(&server.clients_mutex);
+        
+        send_json_message(receiver_socket, "filename_proposal", filename_proposal, "success");
         log_message("[FILE] Proposing filename '%s' to %s", potential_filename, transfer.receiver);
+        
+        // Wait for client response with timeout
+        fd_set read_fds;
+        struct timeval timeout;
+        FD_ZERO(&read_fds);
+        FD_SET(receiver_socket, &read_fds);
+        timeout.tv_sec = 30; // 30 second timeout
+        timeout.tv_usec = 0;
+        
+        int select_result = select(receiver_socket + 1, &read_fds, NULL, NULL, &timeout);
+        if (select_result <= 0) {
+            log_message("[FILE ERROR] Timeout or error waiting for filename response from %s", transfer.receiver);
+            
+            // Clean up temporary file
+            if (strstr(transfer.filename, "temp_") == transfer.filename) {
+                unlink(transfer.filename);
+                log_message("[FILE CLEANUP] Removed temporary file (timeout): %s", transfer.filename);
+            }
+            
+            // Notify both users about timeout
+            pthread_mutex_lock(&server.clients_mutex);
+            current_receiver = find_client_by_username(transfer.receiver);
+            client_t *current_sender = find_client_by_username(transfer.sender);
+            
+            if (current_receiver && current_receiver->active) {
+                send_json_message(current_receiver->socket, "error", "File transfer timeout", "error");
+            }
+            if (current_sender && current_sender->active) {
+                send_json_message(current_sender->socket, "error", "File transfer timeout", "error");
+            }
+            pthread_mutex_unlock(&server.clients_mutex);
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
         
         // Wait for client response (OK or NOT)
         char response_buffer[256];
-        int response_received = recv(receiver->socket, response_buffer, sizeof(response_buffer) - 1, 0);
+        int response_received = recv(receiver_socket, response_buffer, sizeof(response_buffer) - 1, MSG_DONTWAIT);
         if (response_received <= 0) {
             log_message("[FILE ERROR] No response from client %s for filename proposal", transfer.receiver);
-            send_json_message(receiver->socket, "error", "File transfer failed - no response", "error");
             
             // Clean up temporary file
             if (strstr(transfer.filename, "temp_") == transfer.filename) {
@@ -935,7 +1018,26 @@ void* process_file_transfers(void *arg) {
         snprintf(file_header, sizeof(file_header), 
                  "FILE_TRANSFER_START:%s:%s:%zu", 
                  final_filename, transfer.sender, transfer.file_size);
-        send_json_message(receiver->socket, "file_transfer_start", file_header, "success");
+        
+        // Check receiver is still connected before starting transfer
+        pthread_mutex_lock(&server.clients_mutex);
+        current_receiver = find_client_by_username(transfer.receiver);
+        if (!current_receiver || !current_receiver->active) {
+            pthread_mutex_unlock(&server.clients_mutex);
+            log_message("[FILE ERROR] Receiver %s disconnected before file transfer", transfer.receiver);
+            
+            // Clean up temporary file
+            if (strstr(transfer.filename, "temp_") == transfer.filename) {
+                unlink(transfer.filename);
+                log_message("[FILE CLEANUP] Removed temporary file (receiver disconnected): %s", transfer.filename);
+            }
+            
+            sem_post(&server.upload_queue.upload_slots);
+            continue;
+        }
+        pthread_mutex_unlock(&server.clients_mutex);
+        
+        send_json_message(receiver_socket, "file_transfer_start", file_header, "success");
 
         // Give client time to prepare
         usleep(500000); // 500ms
@@ -944,7 +1046,20 @@ void* process_file_transfers(void *arg) {
         FILE *src_file = fopen(transfer.filename, "rb");
         if (!src_file) {
             log_message("[FILE ERROR] Cannot open source file: %s", transfer.filename);
-            send_json_message(receiver->socket, "error", "File transfer failed - source file error", "error");
+            
+            // Notify both users about the error
+            pthread_mutex_lock(&server.clients_mutex);
+            current_receiver = find_client_by_username(transfer.receiver);
+            client_t *current_sender = find_client_by_username(transfer.sender);
+            
+            if (current_receiver && current_receiver->active) {
+                send_json_message(current_receiver->socket, "error", "File transfer failed - source file error", "error");
+            }
+            if (current_sender && current_sender->active) {
+                send_json_message(current_sender->socket, "error", "File transfer failed - source file error", "error");
+            }
+            pthread_mutex_unlock(&server.clients_mutex);
+            
             sem_post(&server.upload_queue.upload_slots);
             continue;
         }
@@ -955,9 +1070,13 @@ void* process_file_transfers(void *arg) {
         
         log_message("[FILE] Sending file data directly to %s...", transfer.receiver);
         
+        // Send file data with error checking
+        int transfer_failed = 0;
         while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
-            if (send(receiver->socket, buffer, bytes_read, 0) <= 0) {
-                log_message("[FILE ERROR] Failed to send file data to %s", transfer.receiver);
+            int send_result = send(receiver_socket, buffer, bytes_read, MSG_NOSIGNAL);
+            if (send_result <= 0) {
+                log_message("[FILE ERROR] Failed to send file data to %s (connection lost)", transfer.receiver);
+                transfer_failed = 1;
                 break;
             }
             bytes_sent += bytes_read;
@@ -965,46 +1084,39 @@ void* process_file_transfers(void *arg) {
 
         fclose(src_file);
 
-        // Step 3: Send completion notification
-        if (bytes_sent == transfer.file_size) {
+        // Step 3: Send completion notification or handle failure
+        if (!transfer_failed && bytes_sent == transfer.file_size) {
             log_message("[FILE SUCCESS] File %s (%zu bytes) sent directly to %s", 
                         original_filename, bytes_sent, transfer.receiver);
             
             char completion_msg[BUFFER_SIZE];
             snprintf(completion_msg, sizeof(completion_msg), 
                      "FILE_TRANSFER_END:%s:%zu", original_filename, bytes_sent);
-            send_json_message(receiver->socket, "file_transfer_end", completion_msg, "success");
             
-            // Clean up temporary file and user temp directory
+            // Check receiver is still connected before sending completion message
+            pthread_mutex_lock(&server.clients_mutex);
+            current_receiver = find_client_by_username(transfer.receiver);
+            if (current_receiver && current_receiver->active) {
+                send_json_message(current_receiver->socket, "file_transfer_end", completion_msg, "success");
+            }
+            pthread_mutex_unlock(&server.clients_mutex);
+            
+            // Clean up temporary file
             if (strstr(transfer.filename, "temp_") == transfer.filename) {
                 unlink(transfer.filename);
                 log_message("[FILE CLEANUP] Removed temporary file: %s", transfer.filename);
-                
-                // Extract user temp directory name from the file path
-                char temp_filename[512];
-                strcpy(temp_filename, transfer.filename);
-                char *dir_end = strrchr(temp_filename, '/');
-                if (dir_end) {
-                    *dir_end = '\0'; // Temporarily terminate the string at the directory
-                    
-                    // Try to remove the user temp directory (will only succeed if empty)
-                    if (rmdir(temp_filename) == 0) {
-                        log_message("[FILE CLEANUP] Removed empty user temp directory: %s", temp_filename);
-                    }
-                }
             }
             
             // Notify sender of successful transfer
             pthread_mutex_lock(&server.clients_mutex);
-            client_t *sender = find_client_by_username(transfer.sender);
-            pthread_mutex_unlock(&server.clients_mutex);
-            
-            if (sender) {
+            client_t *current_sender = find_client_by_username(transfer.sender);
+            if (current_sender && current_sender->active) {
                 char success_msg[512];
                 snprintf(success_msg, sizeof(success_msg), 
                          "File '%s' successfully sent to %s", original_filename, transfer.receiver);
-                send_json_message(sender->socket, "file_complete", success_msg, "success");
+                send_json_message(current_sender->socket, "file_complete", success_msg, "success");
             }
+            pthread_mutex_unlock(&server.clients_mutex);
         } else {
             log_message("[FILE ERROR] Transfer incomplete to %s: expected %zu, sent %zu", 
                         transfer.receiver, transfer.file_size, bytes_sent);
@@ -1017,13 +1129,16 @@ void* process_file_transfers(void *arg) {
             
             // Notify both sender and receiver of failure
             pthread_mutex_lock(&server.clients_mutex);
-            client_t *sender = find_client_by_username(transfer.sender);
-            pthread_mutex_unlock(&server.clients_mutex);
+            current_receiver = find_client_by_username(transfer.receiver);
+            client_t *current_sender = find_client_by_username(transfer.sender);
             
-            if (sender) {
-                send_json_message(sender->socket, "error", "File transfer failed", "error");
+            if (current_receiver && current_receiver->active) {
+                send_json_message(current_receiver->socket, "error", "File transfer failed", "error");
             }
-            send_json_message(receiver->socket, "error", "File transfer failed", "error");
+            if (current_sender && current_sender->active) {
+                send_json_message(current_sender->socket, "error", "File transfer failed", "error");
+            }
+            pthread_mutex_unlock(&server.clients_mutex);
         }
 
         sem_post(&server.upload_queue.upload_slots);
@@ -1032,11 +1147,137 @@ void* process_file_transfers(void *arg) {
     return NULL;
 }
 
+// Clean up pending file transfers for a specific user when they disconnect
+void cleanup_pending_files_for_user(const char *username) {
+    if (!username) return;
+    
+    pthread_mutex_lock(&server.upload_queue.mutex);
+    
+    int cleaned_count = 0;
+    // Check all pending transfers in the queue
+    for (int i = 0; i < server.upload_queue.count; i++) {
+        int index = (server.upload_queue.head + i) % MAX_UPLOAD_QUEUE;
+        file_transfer_t *transfer = &server.upload_queue.transfers[index];
+        
+        // Clean up files where the user is sender or receiver
+        if (strcmp(transfer->sender, username) == 0 || strcmp(transfer->receiver, username) == 0) {
+            // Delete the temporary file if it exists
+            if (strstr(transfer->filename, "temp_") == transfer->filename) {
+                if (unlink(transfer->filename) == 0) {
+                    log_message("[FILE CLEANUP] Removed pending file for disconnected user %s: %s", 
+                               username, transfer->filename);
+                    cleaned_count++;
+                }
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&server.upload_queue.mutex);
+    
+    // Also clean up any orphaned temp files for this user
+    char user_pattern[128];
+    snprintf(user_pattern, sizeof(user_pattern), "files/temp_%s_", username);
+    
+    // Use system command to find and remove user-specific temp files
+    char cleanup_cmd[256];
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "find files/ -name 'temp_%s_*' -type f -delete 2>/dev/null", username);
+    int result = system(cleanup_cmd);
+    (void)result; // Suppress unused variable warning
+    
+    if (cleaned_count > 0) {
+        log_message("[FILE CLEANUP] Cleaned up %d pending files for user %s", cleaned_count, username);
+    }
+}
+
+// Clean up all temporary files in the files directory
+void cleanup_all_temporary_files(void) {
+    log_message("[FILE CLEANUP] Starting cleanup of all temporary files...");
+    
+    // Use system command to remove all temp files
+    int result = system("find files/ -name 'temp_*' -type f -delete 2>/dev/null");
+    (void)result; // Suppress unused variable warning
+    
+    // Try to remove empty directories
+    result = system("find files/ -type d -empty -delete 2>/dev/null");
+    (void)result; // Suppress unused variable warning
+    
+    log_message("[FILE CLEANUP] Temporary file cleanup completed");
+}
+
+// Clean up all pending files in the queue when server shuts down
+void cleanup_queue_on_shutdown(void) {
+    log_message("[FILE CLEANUP] Cleaning up pending file transfers on shutdown...");
+    
+    pthread_mutex_lock(&server.upload_queue.mutex);
+    
+    int cleaned_count = 0;
+    // Clean up all pending transfers
+    for (int i = 0; i < server.upload_queue.count; i++) {
+        int index = (server.upload_queue.head + i) % MAX_UPLOAD_QUEUE;
+        file_transfer_t *transfer = &server.upload_queue.transfers[index];
+        
+        // Delete the temporary file if it exists
+        if (strstr(transfer->filename, "temp_") == transfer->filename) {
+            if (unlink(transfer->filename) == 0) {
+                log_message("[FILE CLEANUP] Removed pending file: %s", transfer->filename);
+                cleaned_count++;
+            }
+        }
+    }
+    
+    // Clear the queue
+    server.upload_queue.head = 0;
+    server.upload_queue.tail = 0;
+    server.upload_queue.count = 0;
+    
+    pthread_mutex_unlock(&server.upload_queue.mutex);
+    
+    // Clean up any remaining temporary files
+    cleanup_all_temporary_files();
+    
+    log_message("[FILE CLEANUP] Cleaned up %d pending files on shutdown", cleaned_count);
+}
+
+// Clean up orphaned files that are older than a certain threshold
+void cleanup_orphaned_files(void) {
+    log_message("[FILE CLEANUP] Checking for orphaned temporary files...");
+    
+    // Use a more sophisticated approach to clean old files
+    char find_cmd[512];
+    snprintf(find_cmd, sizeof(find_cmd), 
+             "find files/ -name 'temp_*' -type f -mmin +60 -delete 2>/dev/null"); // Files older than 60 minutes
+    
+    int result = system(find_cmd);
+    (void)result; // Suppress unused variable warning
+    
+    log_message("[FILE CLEANUP] Orphaned file cleanup completed");
+}
+
+// Periodic cleanup thread function
+void* periodic_cleanup_thread(void *arg) {
+    (void)arg; // Suppress unused parameter warning
+    
+    while (server.running) {
+        // Sleep for 30 minutes
+        sleep(1800);
+        
+        if (!server.running) break;
+        
+        // Perform periodic cleanup
+        cleanup_orphaned_files();
+    }
+    
+    return NULL;
+}
+
 // Clean up client resources
 void cleanup_client(client_t *client) {
     if (!client->active) return;
     
     log_message("[LOGOUT] user '%s' disconnected", client->username);
+    
+    // Clean up pending file transfers for this user
+    cleanup_pending_files_for_user(client->username);
     
     pthread_mutex_lock(&server.clients_mutex);
     client->active = 0;
@@ -1110,6 +1351,10 @@ void handle_command(client_t *client, const char *command) {
     // Update /exit command handling to clean up client resources immediately
     else if (strcmp(token, "/exit") == 0) {
         send_json_message(client->socket, "system", "Goodbye!", "success");
+        
+        // Clean up pending file transfers for this user before disconnecting
+        cleanup_pending_files_for_user(client->username);
+        
         cleanup_client(client); // Clean up client resources immediately
         pthread_exit(NULL); // Exit the client thread
     }
@@ -1248,6 +1493,13 @@ void start_server(int port) {
     // Create the file processor thread
     if (pthread_create(&server.file_processor_thread, NULL, process_file_transfers, NULL) != 0) {
         perror("Failed to create file processor thread");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Create the periodic cleanup thread
+    pthread_t cleanup_thread;
+    if (pthread_create(&cleanup_thread, NULL, periodic_cleanup_thread, NULL) != 0) {
+        perror("Failed to create periodic cleanup thread");
         exit(EXIT_FAILURE);
     }
     
